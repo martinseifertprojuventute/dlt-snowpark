@@ -190,6 +190,17 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
     def native_connection(self) -> Session:
         return self.snowpark_session
 
+    def fully_qualified_dataset_name(self, escape: bool = True, staging: bool = False) -> str:
+        """Override to ensure schema name is always uppercase (Snowflake standard)."""
+        # Apply casefold to ensure uppercase
+        # Use staging schema if requested, otherwise use main schema
+        dataset = self.staging_dataset_name if staging else self.dataset_name
+        schema_name = self.capabilities.casefold_identifier(dataset)
+        if escape:
+            return f'"{self.database}"."{schema_name}"'
+        else:
+            return f"{self.database}.{schema_name}"
+
     def execute_sql(self, sql: str, *args: Any, **kwargs: Any) -> Optional[Sequence[Sequence[Any]]]:
         """Execute SQL and return results."""
         try:
@@ -228,33 +239,34 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
                 # Replace %s placeholders with escaped values
                 query = query.replace('%s', '{}').format(*escaped_args)
 
-        # CRITICAL: Snowpark's session.sql() only executes ONE statement at a time
-        # Split multi-statement SQL and execute each statement separately
-        # (similar to how dlt's Snowflake destination uses num_statements=0)
-        statements = [s.strip() for s in query.split(';') if s.strip()]
+        # Execute query using underlying Snowflake connector cursor
+        # Snowpark's session.sql() doesn't handle all SQL types well (especially with semicolons)
+        # Use the connector cursor directly (like the built-in Snowflake destination does)
+        try:
+            # Get the underlying Snowflake connection from Snowpark session
+            conn = self.snowpark_session._conn._conn
 
-        result = None
-        for stmt in statements:
-            try:
-                # Execute each statement
-                result = self.snowpark_session.sql(stmt).collect()
-            except Exception as ex:
-                # Check if this is an "already exists" error (42710)
-                # These should be ignored in multi-statement execution (like CREATE TABLE IF NOT EXISTS)
-                try:
-                    from snowflake.snowpark.exceptions import SnowparkSQLException
-                    if isinstance(ex, SnowparkSQLException) and hasattr(ex, 'sqlstate'):
-                        if ex.sqlstate == "42710":  # Object already exists - ignore and continue
-                            continue
-                except ImportError:
-                    pass
-                # Check message as fallback
-                if "already exists" in str(ex).lower():
-                    continue
-                # Not an "already exists" error - re-raise
+            # Execute using connector cursor with num_statements=0
+            # This tells Snowflake to execute ALL statements in the query (matching built-in destination)
+            # From dlt's SnowflakeSqlClient.execute_query() line 130: cur.execute(query, db_args, num_statements=0)
+            with conn.cursor() as cur:
+                cur.execute(query, num_statements=0)
+
+                # Fetch results if available
+                if cur.description:
+                    result = cur.fetchall()
+                else:
+                    result = []
+        except Exception as ex:
+            # Check if this is an "already exists" error that should be ignored
+            if "already exists" in str(ex).lower() or "object with same name already exists" in str(ex).lower():
+                # Return empty result for ignored errors
+                result = []
+            else:
+                # Re-raise other errors
                 raise
 
-        # Return result from the last statement (matching Snowflake connector behavior)
+        # Return cursor with results (matching Snowflake connector behavior)
         cursor = SnowparkCursor(result if result is not None else [])
         yield cursor
 
@@ -285,7 +297,8 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
     def has_dataset(self) -> bool:
         """Check if schema exists."""
         try:
-            schema_name = self.dataset_name
+            # Apply casefold to ensure uppercase (Snowflake standard)
+            schema_name = self.capabilities.casefold_identifier(self.dataset_name)
             query = f"""
                 SELECT COUNT(*)
                 FROM INFORMATION_SCHEMA.SCHEMATA
@@ -298,18 +311,15 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
             return False
 
     def create_dataset(self) -> None:
-        """Create schema if it doesn't exist."""
-        schema_name = self.dataset_name
-        self.snowpark_session.sql(
-            f'CREATE SCHEMA IF NOT EXISTS "{self.database}"."{schema_name}"'
-        ).collect()
+        """Create schema if it doesn't exist - use base class implementation."""
+        # Base class uses fully_qualified_dataset_name() which we override to use uppercase
+        # This ensures schema is created with proper casing
+        self.execute_sql("CREATE SCHEMA IF NOT EXISTS %s" % self.fully_qualified_dataset_name())
 
     def drop_dataset(self) -> None:
-        """Drop schema."""
-        schema_name = self.dataset_name
-        self.snowpark_session.sql(
-            f'DROP SCHEMA IF EXISTS "{self.database}"."{schema_name}" CASCADE'
-        ).collect()
+        """Drop schema - use base class implementation."""
+        # Base class uses fully_qualified_dataset_name() which we override to use uppercase
+        self.execute_sql("DROP SCHEMA IF EXISTS %s CASCADE" % self.fully_qualified_dataset_name())
 
     # CRITICAL: Use base class methods for qualified names
     # They properly use capabilities.casefold_identifier which respects Snowflake's casing rules
@@ -426,55 +436,123 @@ class SnowparkLoadJob(RunnableLoadJob, HasFollowupJobs):
         snowpark_session: Session,
         database: str,
         schema: str,
+        table_schema: PreparedTableSchema = None,
     ):
         super().__init__(file_path)
         self.snowpark_session = snowpark_session
         self.database = database.upper()
         self.schema_name = schema.upper()
+        self.table_schema = table_schema
         self._job_client: "SnowparkJobClient" = None
 
     def run(self) -> None:
-        """Load the Parquet file using Snowpark."""
+        """Load the file using Snowpark - handles both Parquet and SQL files."""
         sql_client = self._job_client.sql_client
         table_name = self.load_table_name
 
+        # Check file extension to determine how to handle it
+        if self._file_path.endswith('.sql'):
+            # SQL file - contains merge/delete operations including CREATE TEMPORARY TABLE
+            # CRITICAL: Snowflake stored procedures don't support CREATE TEMPORARY TABLE
+            # We need to replace it with CREATE TABLE (regular table with unique name)
+            #
+            # dlt's SQL job files contain one statement per line (separated by \n)
+            # From sql_jobs.py line 63-64: "Remove line breaks from multiline statements and write
+            # one statement per line in output file to support clients that need to execute
+            # one statement at a time (i.e. snowflake)"
+            with open(self._file_path, 'r', encoding='utf-8') as f:
+                sql_content = f.read()
+
+            # CRITICAL: Snowflake stored procedures do NOT support CREATE TEMPORARY TABLE
+            # (tested with both session.sql() and connector cursor - both fail)
+            # Solution: Replace CREATE TEMPORARY TABLE with CREATE TABLE
+            # The tables have unique names from dlt's uniq_id() so they won't conflict
+            # and they're dropped after the merge operation completes
+            sql_content = sql_content.replace('CREATE TEMPORARY TABLE', 'CREATE TABLE')
+
+            # Split by newline and execute each statement separately
+            statements = [s.strip() for s in sql_content.split('\n') if s.strip()]
+
+            for stmt in statements:
+                try:
+                    # Execute using Snowpark's session.sql()
+                    self.snowpark_session.sql(stmt).collect()
+                except Exception as e:
+                    # Check if it's a "table already exists" error
+                    error_msg = str(e).lower()
+                    if 'already exists' in error_msg or 'object with same name already exists' in error_msg:
+                        # This is expected for staging tables - ignore and continue
+                        continue
+                    else:
+                        # Re-raise other errors
+                        raise
+            return
+
+        # Parquet file - load using DataFrame
         # Read Parquet file as PyArrow Table
         arrow_table = pq.read_table(self._file_path)
 
         if arrow_table.num_rows == 0:
             return  # Skip empty files
 
-        # CRITICAL: Create Snowpark DataFrame directly from PyArrow Table
-        # Convert PyArrow to list of dicts (Snowpark can ingest dicts directly)
-        # This is much simpler than converting to tuples and avoids pandas
+        # Convert PyArrow to list of dicts for Snowpark DataFrame
         data = arrow_table.to_pylist()
 
         # Create Snowpark DataFrame from list of dicts
+        # Snowpark will infer schema from the data (similar to how COPY INTO infers from Parquet)
         df = self.snowpark_session.create_dataframe(data)
 
-        # Get fully qualified table name
+        # Get fully qualified table name - this uses the CORRECT schema (main or staging)
         qualified_table = sql_client.make_qualified_table_name(table_name)
 
-        # CRITICAL: Use temp table + INSERT pattern (like dlt's Snowflake PUT/COPY INTO)
-        # save_as_table() tries to CREATE TABLE which fails if table exists
-        # Temp table approach: create temp → insert from temp → drop temp
+        # CRITICAL: Use Snowpark's copy_into_table which mimics dlt's COPY INTO behavior
+        # This handles type conversions automatically (like COPY INTO with MATCH_BY_COLUMN_NAME)
+        # The key is that Snowflake's COPY INTO automatically coerces types:
+        # - VARCHAR → VARIANT (converts to JSON)
+        # - Numeric strings → numbers
+        # - etc.
 
-        # Create a simple temp table name
+        # Get column list from Parquet for INSERT
+        parquet_columns = [field.name for field in arrow_table.schema]
+        escaped_columns = [sql_client.escape_column_name(col) for col in parquet_columns]
+        columns_list = ", ".join(escaped_columns)
+
+        # APPROACH: Use temp table + INSERT with SELECT *
+        # This allows Snowflake to handle type coercion (like COPY INTO does)
+        current_schema = sql_client.capabilities.casefold_identifier(sql_client.dataset_name)
         temp_table_simple = f"{table_name.upper()}_TEMP_{uniq_id(4).upper()}"
+        temp_table_qualified = f'"{self.database}"."{current_schema}"."{temp_table_simple}"'
 
-        # Full qualified temp table name (database.schema.table format without quotes for save_as_table)
-        # save_as_table() accepts dotted notation like "database.schema.table"
-        temp_table_for_save = f"{self.database}.{self.schema_name}.{temp_table_simple}"
+        # Write DataFrame to temp table (Snowpark infers types from data)
+        df.write.mode("overwrite").save_as_table(f"{self.database}.{current_schema}.{temp_table_simple}")
 
-        # Full qualified temp table name with quotes for SQL statements
-        temp_table_qualified = sql_client.make_qualified_table_name(temp_table_simple)
+        # Query target table schema to identify VARIANT columns that need casting
+        get_columns_query = f"""
+            SELECT COLUMN_NAME, DATA_TYPE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '{current_schema}'
+            AND TABLE_NAME = '{table_name.upper()}'
+            AND TABLE_CATALOG = '{self.database}'
+        """
+        target_columns_result = self.snowpark_session.sql(get_columns_query).collect()
+        target_column_types = {row[0]: row[1] for row in target_columns_result}
 
-        # Write to temp table (this creates the table)
-        # save_as_table() accepts database.schema.table notation
-        df.write.mode("overwrite").save_as_table(temp_table_for_save)
+        # Build SELECT with TO_VARIANT() for VARIANT columns
+        select_parts = []
+        for col in parquet_columns:
+            col_upper = col.upper()
+            escaped_col = sql_client.escape_column_name(col)
 
-        # Insert from temp table to actual table
-        insert_sql = f"INSERT INTO {qualified_table} SELECT * FROM {temp_table_qualified}"
+            # Cast to VARIANT if target column is VARIANT
+            if col_upper in target_column_types and target_column_types[col_upper] == 'VARIANT':
+                select_parts.append(f"TO_VARIANT({escaped_col})")
+            else:
+                select_parts.append(escaped_col)
+
+        select_clause = ", ".join(select_parts)
+
+        # Insert from temp to target with type casting for VARIANT columns
+        insert_sql = f"INSERT INTO {qualified_table} ({columns_list}) SELECT {select_clause} FROM {temp_table_qualified}"
         self.snowpark_session.sql(insert_sql).collect()
 
         # Drop temp table
@@ -587,14 +665,55 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
         return caps
 
     def _ensure_schema_exists(self) -> None:
-        """Create the schema if it doesn't exist."""
+        """Create both main and staging schemas if they don't exist."""
         try:
-            if not self.sql_client.has_dataset():
-                self.sql_client.create_dataset()
-            # Use the schema
-            self.snowpark_session.sql(
-                f'USE SCHEMA "{self.database}"."{self.sql_client.dataset_name}"'
-            ).collect()
+            # Create main schema (e.g., JIRA) - matches dlt's built-in Snowflake destination
+            # IMPORTANT: Apply casefold to ensure proper casing (uppercase for Snowflake)
+            main_schema = self.sql_client.dataset_name
+            main_schema_cased = self.sql_client.capabilities.casefold_identifier(main_schema)
+
+            # Check if main schema exists
+            check_main_query = f"""
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.SCHEMATA
+                WHERE SCHEMA_NAME = '{main_schema_cased}'
+                AND CATALOG_NAME = '{self.database}'
+            """
+            result = self.snowpark_session.sql(check_main_query).collect()
+            main_exists = result[0][0] > 0 if result else False
+
+            if not main_exists:
+                # Create main schema with proper casing
+                self.snowpark_session.sql(
+                    f'CREATE SCHEMA IF NOT EXISTS "{self.database}"."{main_schema_cased}"'
+                ).collect()
+
+            # Create staging schema (e.g., JIRA_STAGING) - matches dlt's built-in Snowflake destination
+            # The built-in destination creates staging schema on-demand via sql_client
+            staging_schema = self.sql_client.staging_dataset_name
+            if staging_schema:
+                # IMPORTANT: Apply casefold to ensure proper casing (uppercase for Snowflake)
+                staging_schema_cased = self.sql_client.capabilities.casefold_identifier(staging_schema)
+
+                # Check if staging schema exists
+                check_query = f"""
+                    SELECT COUNT(*)
+                    FROM INFORMATION_SCHEMA.SCHEMATA
+                    WHERE SCHEMA_NAME = '{staging_schema_cased}'
+                    AND CATALOG_NAME = '{self.database}'
+                """
+                result = self.snowpark_session.sql(check_query).collect()
+                staging_exists = result[0][0] > 0 if result else False
+
+                if not staging_exists:
+                    # Create staging schema with proper casing
+                    self.snowpark_session.sql(
+                        f'CREATE SCHEMA IF NOT EXISTS "{self.database}"."{staging_schema_cased}"'
+                    ).collect()
+
+            # NOTE: dlt's built-in Snowflake destination does NOT use USE SCHEMA
+            # It uses fully qualified table names (database.schema.table) in all queries
+            # We follow the same pattern - don't set a default schema
         except Exception as e:
             print(f"Warning: Could not create/use schema: {e}")
 
@@ -611,6 +730,7 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
             snowpark_session=self.snowpark_session,
             database=self.database,
             schema=self.sql_client.dataset_name,
+            table_schema=table,
         )
 
     def _create_merge_followup_jobs(
@@ -654,8 +774,8 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
             state_table = self.sql_client.make_qualified_table_name("_dlt_pipeline_state")
             loads_table = self.sql_client.make_qualified_table_name("_dlt_loads")
 
-            # Query latest state with successful load (INNER JOIN like dlt's reference implementation)
-            # Join on load_id column from loads table and _dlt_load_id from state table
+            # Query latest state - use LEFT JOIN to include states even if load isn't recorded yet
+            # This handles the case where state is saved but load completion isn't finalized
             query = f"""
                 SELECT
                     s.version,
@@ -664,11 +784,11 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
                     s.created_at,
                     s._dlt_load_id
                 FROM {state_table} AS s
-                JOIN {loads_table} AS l
+                LEFT JOIN {loads_table} AS l
                     ON l.load_id = s._dlt_load_id
                 WHERE s.pipeline_name = %s
-                    AND l.status = 0
-                ORDER BY l.load_id DESC
+                    AND (l.status = 0 OR l.status IS NULL)
+                ORDER BY s.created_at DESC
                 LIMIT 1
             """
 
@@ -678,38 +798,27 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
             if not row:
                 return None
 
-            # Parse state from VARIANT column
-            # CRITICAL: State can be stored in multiple formats:
-            # 1. Base64-encoded gzip-compressed JSON (from dlt's state serialization)
-            # 2. Plain dict (Snowpark VARIANT returns as dict)
-            # 3. JSON string
-            state_variant = row[2]
+            # CRITICAL: Return state as-is (compressed string)
+            # dlt's load_pipeline_state_from_destination() will call decompress_state() on it
+            # We should NOT decompress it here - just return the raw state string from the database
+            state_value = row[2]
 
-            if isinstance(state_variant, str):
-                # Try to decode base64 + decompress
-                try:
-                    # Decode base64
-                    compressed_data = base64.b64decode(state_variant)
-                    # Decompress with zlib
-                    decompressed_json = zlib.decompress(compressed_data).decode('utf-8')
-                    # Parse JSON
-                    state_dict = json.loads(decompressed_json)
-                except Exception:
-                    # Not base64/compressed, try plain JSON
-                    try:
-                        state_dict = json.loads(state_variant)
-                    except Exception:
-                        state_dict = {}
-            elif isinstance(state_variant, dict):
-                state_dict = state_variant
+            # Ensure state is a string (Snowflake VARIANT might return as dict or other type)
+            if isinstance(state_value, str):
+                state_str = state_value
+            elif isinstance(state_value, bytes):
+                state_str = state_value.decode('utf-8')
             else:
-                state_dict = dict(state_variant) if state_variant else {}
+                # If it's a dict or other type, convert to JSON string
+                # This shouldn't happen with compressed state, but handle it gracefully
+                import json as json_module
+                state_str = json_module.dumps(state_value) if state_value else ""
 
             return StateInfo(
                 version=int(row[0]) if row[0] else 1,
                 engine_version=int(row[1]) if row[1] else 1,
                 pipeline_name=pipeline_name,
-                state=state_dict,
+                state=state_str,  # Return compressed state string, not decompressed dict
                 _dlt_load_id=row[4],
                 version_hash=None
             )

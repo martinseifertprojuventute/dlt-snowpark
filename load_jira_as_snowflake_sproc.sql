@@ -265,12 +265,37 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
         # =====================================================================
         from snowpark_destination import snowpark
 
+        # Check if we have existing data to determine the min date for incremental loading
+        initial_date = "1970-01-01"  # Default for first run
+        if "issues" in endpoint_list:
+            try:
+                max_updated_query = "SELECT MAX(fields__updated) as max_updated FROM RAW.JIRA.ISSUES"
+                max_updated_df = snowpark_session.sql(max_updated_query).collect()
+                max_updated = max_updated_df[0][0] if (max_updated_df and max_updated_df[0][0]) else None
+
+                if max_updated:
+                    # Extract just the date part (YYYY-MM-DD) from the timestamp
+                    last_updated = str(max_updated)
+                    if 'T' in last_updated:
+                        initial_date = last_updated.split('T')[0]
+                    elif ' ' in last_updated:
+                        initial_date = last_updated.split(' ')[0]
+                    else:
+                        initial_date = last_updated[:10]  # First 10 chars should be YYYY-MM-DD
+            except:
+                pass  # Use default
+
         # Create Jira source with credentials
         source = jira(
             subdomain=jira_subdomain,
             email=jira_username,
             api_token=jira_api_token,
         ).with_resources(*endpoint_list)
+
+        # CRITICAL: Apply hints to override the incremental initial_value with our calculated date
+        # This tells the issues resource to start from initial_date instead of 1970-01-01
+        if "issues" in endpoint_list and initial_date != "1970-01-01":
+            source.issues.apply_hints(incremental=dlt.sources.incremental("fields.updated", initial_value=initial_date))
 
         # Create pipeline with Snowpark destination
         # CRITICAL: In Snowpark, local filesystem is ephemeral - state MUST come from destination!
@@ -282,7 +307,7 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
             full_refresh=False  # Allow incremental loading
         )
 
-        # Run pipeline - state automatically restored and persisted via WithStateSync
+        # Run pipeline - incremental loading will start from initial_date
         load_info = pipeline.run(source)
 
         # Prepare result
@@ -299,6 +324,10 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
                 "started_at": str(load_info.started_at) if load_info.started_at else None,
                 "finished_at": str(load_info.finished_at) if load_info.finished_at else None,
                 "jobs": len(load_info.jobs) if hasattr(load_info, 'jobs') else 0,
+            },
+            "incremental_config": {
+                "initial_date_used": initial_date if "issues" in endpoint_list else "N/A",
+                "note": "Loading issues updated since this date" if initial_date != "1970-01-01" else "First run - loading all historical data"
             },
             "note": "Using custom Snowpark destination - no Snowflake connector needed!"
         }
