@@ -8,7 +8,7 @@ LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
 HANDLER = 'load_jira_data'
 ARTIFACT_REPOSITORY = snowflake.snowpark.pypi_shared_repository
-PACKAGES = ('snowflake-snowpark-python', 'requests', 'dlt[parquet]', 'pyarrow', 'pandas')
+PACKAGES = ('snowflake-snowpark-python', 'requests', 'dlt[parquet]', 'pyarrow')
 IMPORTS = ('@META.PYTHON.S_PYTHON/dlt/snowpark_destination.py')
 COMMENT = 'Load Jira data using dlt pipeline - combines issues and projects endpoints'
 EXTERNAL_ACCESS_INTEGRATIONS = (i_jira_dlt)
