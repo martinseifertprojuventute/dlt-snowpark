@@ -1,7 +1,6 @@
 CREATE OR REPLACE PROCEDURE raw.jira.p_load_jira(
     target_database VARCHAR DEFAULT 'RAW',  -- Target database for dlt destination
     endpoints VARCHAR DEFAULT NULL,  -- Optional: JSON array of endpoint names, e.g., '["issues", "projects"]'
-    debug_extract_only BOOLEAN DEFAULT FALSE,  -- If TRUE, only extract+normalize without loading (for debugging)
     force_full_load BOOLEAN DEFAULT FALSE  -- If TRUE, load all historical data from 1970-01-01 (ignores existing data)
 )
 RETURNS VARCHAR
@@ -233,7 +232,7 @@ def jira(
 # STORED PROCEDURE MAIN FUNCTION
 # ============================================================================
 
-def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Optional[str] = None, debug_extract_only: bool = False, force_full_load: bool = False) -> str:
+def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Optional[str] = None, force_full_load: bool = False) -> str:
     """
     Main stored procedure function to load Jira data using dlt with Snowpark destination.
 
@@ -241,7 +240,6 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
         snowpark_session: Snowpark session object (automatically provided)
         target_database: Target database for dlt destination (default: 'RAW')
         endpoints: Optional JSON string of endpoint names. If None, loads all.
-        debug_extract_only: If True, only extract+normalize without loading (for debugging)
         force_full_load: If True, load all historical data from 1970-01-01 (ignores existing data)
 
     Returns:
@@ -296,60 +294,12 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
             api_token=jira_api_token,
         ).with_resources(*endpoint_list)
 
-        # CRITICAL: Apply hints to override the incremental initial_value with our calculated date
+        # Apply hints to override the incremental initial_value with our calculated date
         # This tells the issues resource to start from initial_date instead of 1970-01-01
         if "issues" in endpoint_list and initial_date != "1970-01-01":
             source.issues.apply_hints(incremental=dlt.sources.incremental("fields.updated", initial_value=initial_date))
 
-        # =====================================================================
-        # TWO-STAGE APPROACH: Extract+Normalize first, then Load once
-        # =====================================================================
-        # This is how dlt's built-in destinations work:
-        # 1. extract() - Extract data from source
-        # 2. normalize() - Normalize to parquet files in /tmp
-        # 3. load() - Bulk load all normalized files to destination in ONE operation
-        #
-        # This avoids the incremental loading problem where each extraction batch
-        # triggers a separate merge operation
-
-        import os
-        import shutil
-        import time
-
-        # Clean up from previous runs BEFORE creating pipeline
-        # Remove old pipeline directories to force fresh state
-        try:
-            if os.path.exists("/tmp/dlt_pipelines"):
-                shutil.rmtree("/tmp/dlt_pipelines")
-        except:
-            pass
-
-        # Drop and recreate staging schema as TRANSIENT
-        # TRANSIENT = no fail-safe, reduced time travel (perfect for staging data)
-        try:
-            snowpark_session.sql(f"DROP SCHEMA IF EXISTS {target_database}.JIRA_STAGING CASCADE").collect()
-            time.sleep(1)  # Give Snowflake a moment to complete the drop
-            snowpark_session.sql(f"CREATE TRANSIENT SCHEMA {target_database}.JIRA_STAGING").collect()
-        except:
-            pass
-
-        # CRITICAL: Clear dlt pipeline state to prevent re-loading old pending packages
-        # Each failed run leaves pending packages that get re-processed on next run
-        # This causes the merge count to grow (4 → 6 → 7 → ...)
-        try:
-            snowpark_session.sql(f"DELETE FROM {target_database}.JIRA._DLT_PIPELINE_STATE WHERE pipeline_name = 'jira_snowpark'").collect()
-        except:
-            pass  # Ignore if table doesn't exist yet
-
-        # CRITICAL: Configure dlt to use VERY large buffers to create ONE load package
-        # This prevents multiple load packages which would cause dozens of merge statements
-        # Set buffer size to essentially unlimited to accumulate ALL data before creating package
-        import os as _os
-        _os.environ["DATA_WRITER__BUFFER_MAX_ITEMS"] = "1000000"  # 1 million items per buffer
-        _os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "1000000"    # 1 million items per file
-        _os.environ["NORMALIZE__LOADER_FILE_FORMAT"] = "jsonl"    # Use JSONL instead of parquet for simplicity
-
-        # Now create fresh pipeline
+        # Create dlt pipeline with Snowpark destination
         pipeline = dlt.pipeline(
             pipeline_name="jira_snowpark",
             destination=snowpark(snowpark_session=snowpark_session, database=target_database),
@@ -358,118 +308,29 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
             full_refresh=False
         )
 
-        # CRITICAL: Drop any pending packages from previous runs
-        # This prevents dlt from re-loading old packages which would cause multiple MERGEs
-        try:
-            pipeline.drop_pending_packages()
-        except:
-            pass  # Ignore if no pending packages
-
-        # DEBUG: Clear debug log file before running
-        try:
-            with open('/tmp/dlt_sql_execution_log.txt', 'w') as log:
-                log.write(f"=== SQL Execution Log for {endpoint_list} ===\n")
-        except:
-            pass
-
-        # CRITICAL: Use pipeline.run() instead of extract/normalize/load separately
-        # This ensures dlt creates packages optimally without multiple packages per table
-        # The three-stage approach was causing multiple packages even with workers=1
-
-        # Wrap in try/except so we can return debug info even if pipeline fails
-        pipeline_error = None
-        timeout_occurred = False
-
-        try:
-            if debug_extract_only:
-                # DEBUG MODE: Only extract and normalize, don't load
-                # This lets us see how many SQL files were created without executing them
-                pipeline.extract(source)
-                normalize_info = pipeline.normalize()
-
-                # Count SQL files generated
-                import os as _count_os
-                sql_files = []
-                load_path = "/tmp/dlt_pipelines/jira_snowpark/load"
-                if _count_os.path.exists(load_path):
-                    for load_id_dir in _count_os.listdir(load_path):
-                        load_id_path = _count_os.path.join(load_path, load_id_dir)
-                        if _count_os.path.isdir(load_id_path):
-                            for file in _count_os.listdir(load_id_path):
-                                if file.endswith('.sql'):
-                                    sql_files.append(f"{load_id_dir}/{file}")
-
-                # Write to log
-                try:
-                    with open('/tmp/dlt_sql_execution_log.txt', 'a') as log:
-                        log.write(f"Found {len(sql_files)} SQL files after normalize:\n")
-                        for f in sql_files[:20]:  # First 20 files
-                            log.write(f"  - {f}\n")
-                        if len(sql_files) > 20:
-                            log.write(f"  ... and {len(sql_files) - 20} more\n")
-                except:
-                    pass
-
-                load_info = None
-            else:
-                # Run the pipeline normally
-                # The emergency stop in snowpark_destination.py will raise an exception
-                # after processing the first ISSUES SQL file
-                load_info = pipeline.run(source, loader_file_format="parquet")
-
-        except Exception as e:
-            pipeline_error = str(e)
-            load_info = None  # Set to None so we can still return debug info
-
-        # DEBUG: Read SQL execution log
-        sql_execution_log = "Log file not found"
-        try:
-            with open('/tmp/dlt_sql_execution_log.txt', 'r') as log:
-                sql_execution_log = log.read()
-        except:
-            pass
-
-        # If pipeline failed, return error with debug info
-        if pipeline_error:
-            # Check if it's our debug stop
-            is_debug_stop = "DEBUG: Stopped after" in pipeline_error
-            return json.dumps({
-                "status": "debug_stop" if is_debug_stop else "error",
-                "error": pipeline_error[:1000],  # Show more of the error message
-                "debug_info": {
-                    "sql_execution_log": sql_execution_log,
-                    "emergency_stop_triggered": is_debug_stop
-                }
-            })
-
-        debug_info = {
-            "load_packages_count": len(load_info.loads_ids) if load_info and hasattr(load_info, 'loads_ids') else "unknown",
-            "load_ids": str(load_info.loads_ids) if load_info and hasattr(load_info, 'loads_ids') else "unknown",
-            "sql_execution_log": sql_execution_log,
-            "debug_mode": "extract_only" if debug_extract_only else "full_run"
-        }
+        # Run the pipeline
+        load_info = pipeline.run(source, loader_file_format="parquet")
 
         # Prepare result
         result = {
             "status": "success",
             "pipeline_name": "jira_snowpark",
             "dataset_name": "jira",
-            "destination": "snowpark_custom",
+            "destination": "snowpark",
             "database": target_database,
-            "debug_info": debug_info,
             "schema": "jira",
             "endpoints_loaded": endpoint_list,
             "load_info": {
-                "dataset_name": load_info.dataset_name if load_info else "N/A (debug mode)",
-                "started_at": str(load_info.started_at) if load_info and load_info.started_at else None,
-                "finished_at": str(load_info.finished_at) if load_info and load_info.finished_at else None,
-                "jobs": len(load_info.jobs) if load_info and hasattr(load_info, 'jobs') else 0,
+                "dataset_name": load_info.dataset_name,
+                "started_at": str(load_info.started_at) if load_info.started_at else None,
+                "finished_at": str(load_info.finished_at) if load_info.finished_at else None,
+                "jobs": len(load_info.jobs) if hasattr(load_info, 'jobs') else 0,
+                "packages": len(load_info.loads_ids) if hasattr(load_info, 'loads_ids') else 0
             },
             "incremental_config": {
                 "initial_date_used": initial_date if "issues" in endpoint_list else "N/A",
-                "note": "Loading issues updated since this date" if initial_date != "1970-01-01" else "First run - loading all historical data"
-            },
-            "note": "Using custom Snowpark destination - no Snowflake connector needed!"
+                "note": "Loading issues updated since this date" if initial_date != "1970-01-01" else "Full historical load from 1970-01-01"
+            }
         }
 
         return json.dumps(result, indent=2)
@@ -486,7 +347,13 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
         return json.dumps(error_result, indent=2)
 $$;
 
-
--- Test call (uncomment to run):
-CALL raw.jira.p_load_jira('RAW', '["projects"]');
-CALL raw.jira.p_load_jira('RAW', '["issues"]', FALSE, TRUE);
+-- Example calls:
+-- Load specific endpoints:
+--   CALL raw.jira.p_load_jira('RAW', '["issues"]');
+--   CALL raw.jira.p_load_jira('RAW', '["projects"]');
+--
+-- Load all endpoints:
+--   CALL raw.jira.p_load_jira('RAW');
+--
+-- Force full historical load (ignores existing data):
+--   CALL raw.jira.p_load_jira('RAW', '["issues"]', TRUE);

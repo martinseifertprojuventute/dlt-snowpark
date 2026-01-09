@@ -459,11 +459,6 @@ class SnowparkLoadJob(RunnableLoadJob):
 
         # Check file extension to determine how to handle it
         if self._file_path.endswith('.sql'):
-            import os as _log_os
-            import time
-            file_name = _log_os.path.basename(self._file_path)
-            debug_table = file_name.split('_')[0] if '_' in file_name else 'unknown'
-
             # SQL file - contains merge/delete operations including CREATE TEMPORARY TABLE
             # CRITICAL: Snowflake stored procedures don't support CREATE TEMPORARY TABLE
             # We need to replace it with CREATE TABLE (regular table with unique name)
@@ -474,19 +469,6 @@ class SnowparkLoadJob(RunnableLoadJob):
             # one statement at a time (i.e. snowflake)"
             with open(self._file_path, 'r', encoding='utf-8') as f:
                 sql_content = f.read()
-
-            # Log to a file we can inspect after the run
-            # Count how many MERGE statements are in this file
-            merge_count = sql_content.upper().count('MERGE INTO')
-            import time
-            try:
-                with open('/tmp/dlt_sql_execution_log.txt', 'a') as log:
-                    log.write(f"[{time.strftime('%H:%M:%S')}] File: {file_name}, Table: {debug_table}, MERGE statements: {merge_count}\n")
-                    log.write(f"  Full path: {self._file_path}\n")
-                    # Also log first 500 chars of SQL to understand structure
-                    log.write(f"  First 500 chars: {sql_content[:500]}\n\n")
-            except:
-                pass  # Ignore logging errors
 
             # CRITICAL: Snowflake stored procedures do NOT support CREATE TEMPORARY TABLE
             # (tested with both session.sql() and connector cursor - both fail)
@@ -593,6 +575,19 @@ class SnowparkLoadJob(RunnableLoadJob):
                 self.snowpark_session.sql(f"DROP STAGE IF EXISTS {qualified_stage}").collect()
             except:
                 pass  # Ignore cleanup errors
+
+
+# ============================================================================
+# Merge Job Implementation
+# ============================================================================
+#
+# CRITICAL: We do NOT define a custom SnowparkMergeJob class!
+# Instead, we use dlt's built-in SqlMergeFollowupJob which generates optimized
+# native MERGE INTO statements for Snowflake.
+#
+# The original SnowparkMergeJob used a DELETE+INSERT pattern which was much slower
+# and caused multiple MERGE statements per table. By using the built-in class,
+# we get the same optimized MERGE SQL as dlt's Snowflake destination.
 
 
 # ============================================================================
@@ -751,14 +746,6 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
         Uses dlt's built-in SqlMergeFollowupJob which generates optimized
         native MERGE INTO statements, exactly like the Snowflake destination.
         """
-        # DEBUG: Log when merge jobs are created
-        root_table_name = table_chain[0]["name"] if table_chain else "unknown"
-        try:
-            with open('/tmp/dlt_sql_execution_log.txt', 'a') as log:
-                log.write(f"Creating merge job for table chain: {root_table_name} (chain length: {len(table_chain)})\n")
-        except:
-            pass
-
         return [SqlMergeFollowupJob.from_table_chain(table_chain, self.sql_client)]
 
     def _make_add_column_sql(
