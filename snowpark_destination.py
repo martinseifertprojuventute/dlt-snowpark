@@ -596,19 +596,6 @@ class SnowparkLoadJob(RunnableLoadJob):
 
 
 # ============================================================================
-# Merge Job Implementation
-# ============================================================================
-#
-# CRITICAL: We do NOT define a custom SnowparkMergeJob class!
-# Instead, we use dlt's built-in SqlMergeFollowupJob which generates optimized
-# native MERGE INTO statements for Snowflake.
-#
-# The original SnowparkMergeJob used a DELETE+INSERT pattern which was much slower
-# and caused multiple MERGE statements per table. By using the built-in class,
-# we get the same optimized MERGE SQL as dlt's Snowflake destination.
-
-
-# ============================================================================
 # Job Client with WithStateSync
 # ============================================================================
 
