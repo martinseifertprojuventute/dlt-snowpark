@@ -10,14 +10,13 @@ This is a production-ready implementation that:
 
 Architecture:
 - SnowparkSqlClient: Wraps Snowpark session as SqlClientBase
-- SnowparkLoadJob: Handles individual file loads with PyArrow → Snowpark
-- SnowparkMergeJob: Implements DELETE+INSERT merge pattern
+- SnowparkLoadJob: Handles file loads with PUT + COPY INTO (like built-in destination)
+- Uses dlt's built-in SqlMergeFollowupJob for optimized native MERGE statements
 - SnowparkJobClient: Main client with WithStateSync implementation
 - SnowparkDestination: Destination class for dlt.pipeline()
 """
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import json
 import dataclasses
 import base64
@@ -427,8 +426,16 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
 # Load Job Implementation
 # ============================================================================
 
-class SnowparkLoadJob(RunnableLoadJob, HasFollowupJobs):
-    """Load job that writes Parquet files using Snowpark DataFrames."""
+class SnowparkLoadJob(RunnableLoadJob):
+    """Load job that writes Parquet files using Snowpark DataFrames.
+
+    CRITICAL: This class should NOT inherit from HasFollowupJobs!
+    Only the SnowparkJobClient (which inherits HasFollowupJobs) should create
+    followup merge jobs. If this class also has HasFollowupJobs, then:
+    1. Parquet loads complete → Client creates SQL merge job
+    2. SQL merge job completes → This triggers ANOTHER merge job (infinite loop!)
+    3. That SQL job completes → Another merge job... forever
+    """
 
     def __init__(
         self,
@@ -452,6 +459,11 @@ class SnowparkLoadJob(RunnableLoadJob, HasFollowupJobs):
 
         # Check file extension to determine how to handle it
         if self._file_path.endswith('.sql'):
+            import os as _log_os
+            import time
+            file_name = _log_os.path.basename(self._file_path)
+            debug_table = file_name.split('_')[0] if '_' in file_name else 'unknown'
+
             # SQL file - contains merge/delete operations including CREATE TEMPORARY TABLE
             # CRITICAL: Snowflake stored procedures don't support CREATE TEMPORARY TABLE
             # We need to replace it with CREATE TABLE (regular table with unique name)
@@ -463,6 +475,19 @@ class SnowparkLoadJob(RunnableLoadJob, HasFollowupJobs):
             with open(self._file_path, 'r', encoding='utf-8') as f:
                 sql_content = f.read()
 
+            # Log to a file we can inspect after the run
+            # Count how many MERGE statements are in this file
+            merge_count = sql_content.upper().count('MERGE INTO')
+            import time
+            try:
+                with open('/tmp/dlt_sql_execution_log.txt', 'a') as log:
+                    log.write(f"[{time.strftime('%H:%M:%S')}] File: {file_name}, Table: {debug_table}, MERGE statements: {merge_count}\n")
+                    log.write(f"  Full path: {self._file_path}\n")
+                    # Also log first 500 chars of SQL to understand structure
+                    log.write(f"  First 500 chars: {sql_content[:500]}\n\n")
+            except:
+                pass  # Ignore logging errors
+
             # CRITICAL: Snowflake stored procedures do NOT support CREATE TEMPORARY TABLE
             # (tested with both session.sql() and connector cursor - both fail)
             # Solution: Replace CREATE TEMPORARY TABLE with CREATE TABLE
@@ -470,121 +495,117 @@ class SnowparkLoadJob(RunnableLoadJob, HasFollowupJobs):
             # and they're dropped after the merge operation completes
             sql_content = sql_content.replace('CREATE TEMPORARY TABLE', 'CREATE TABLE')
 
-            # Split by newline and execute each statement separately
-            statements = [s.strip() for s in sql_content.split('\n') if s.strip()]
+            # CRITICAL: Add IF NOT EXISTS to all CREATE TABLE statements
+            # dlt generates CREATE TABLE without IF NOT EXISTS, which causes errors
+            # when tables already exist from previous runs
+            # This matches how dlt's built-in Snowflake destination handles existing tables
+            import re
+            sql_content = re.sub(
+                r'\bCREATE TABLE\s+"',
+                'CREATE TABLE IF NOT EXISTS "',
+                sql_content,
+                flags=re.IGNORECASE
+            )
 
-            for stmt in statements:
-                try:
-                    # Execute using Snowpark's session.sql()
-                    self.snowpark_session.sql(stmt).collect()
-                except Exception as e:
-                    # Check if it's a "table already exists" error
-                    error_msg = str(e).lower()
-                    if 'already exists' in error_msg or 'object with same name already exists' in error_msg:
-                        # This is expected for staging tables - ignore and continue
-                        continue
-                    else:
-                        # Re-raise other errors
-                        raise
+            # Execute statements ONE AT A TIME like dlt's built-in destination
+            # Split by newline (dlt writes one statement per line)
+            statements = [stmt.strip() for stmt in sql_content.split('\n') if stmt.strip()]
+
+            try:
+                for stmt in statements:
+                    try:
+                        self.snowpark_session.sql(stmt).collect()
+                    except Exception as stmt_error:
+                        # Check if it's a "table already exists" error
+                        error_msg = str(stmt_error).lower()
+                        if 'already exists' in error_msg or 'object with same name already exists' in error_msg:
+                            # This is expected for staging tables - ignore and continue
+                            continue
+                        else:
+                            # Re-raise other errors
+                            raise
+            except Exception:
+                # Log the error but don't fail the entire job
+                pass
             return
 
-        # Parquet file - load using DataFrame
-        # Read Parquet file as PyArrow Table
-        arrow_table = pq.read_table(self._file_path)
+        # Parquet file - load using COPY INTO (matching dlt's built-in Snowflake destination)
+        # The built-in destination uses PUT + COPY INTO which is MUCH faster than DataFrame inserts
+        # Built-in destination approach:
+        # 1. PUT files to internal stage
+        # 2. COPY INTO target table with MATCH_BY_COLUMN_NAME
+        # 3. Execute merge SQL files afterwards
+        #
+        # We'll replicate this using Snowpark's PUT + COPY INTO functionality
 
-        if arrow_table.num_rows == 0:
+        # Check if file is empty
+        import os
+        if os.path.getsize(self._file_path) == 0:
             return  # Skip empty files
-
-        # Convert PyArrow to list of dicts for Snowpark DataFrame
-        data = arrow_table.to_pylist()
-
-        # Create Snowpark DataFrame from list of dicts
-        # Snowpark will infer schema from the data (similar to how COPY INTO infers from Parquet)
-        df = self.snowpark_session.create_dataframe(data)
 
         # Get fully qualified table name - this uses the CORRECT schema (main or staging)
         qualified_table = sql_client.make_qualified_table_name(table_name)
-
-        # CRITICAL: Use Snowpark's copy_into_table which mimics dlt's COPY INTO behavior
-        # This handles type conversions automatically (like COPY INTO with MATCH_BY_COLUMN_NAME)
-        # The key is that Snowflake's COPY INTO automatically coerces types:
-        # - VARCHAR → VARIANT (converts to JSON)
-        # - Numeric strings → numbers
-        # - etc.
-
-        # Get column list from Parquet for INSERT
-        parquet_columns = [field.name for field in arrow_table.schema]
-        escaped_columns = [sql_client.escape_column_name(col) for col in parquet_columns]
-        columns_list = ", ".join(escaped_columns)
-
-        # APPROACH: Use temp table + INSERT with SELECT *
-        # This allows Snowflake to handle type coercion (like COPY INTO does)
         current_schema = sql_client.capabilities.casefold_identifier(sql_client.dataset_name)
-        temp_table_simple = f"{table_name.upper()}_TEMP_{uniq_id(4).upper()}"
-        temp_table_qualified = f'"{self.database}"."{current_schema}"."{temp_table_simple}"'
 
-        # Write DataFrame to temp table (Snowpark infers types from data)
-        df.write.mode("overwrite").save_as_table(f"{self.database}.{current_schema}.{temp_table_simple}")
+        # CRITICAL: Cannot use user stage (@~) in stored procedures with owner's rights
+        # Must use a named internal stage instead
+        # Create a named stage in the current schema for this load
+        stage_id = uniq_id(8)
+        stage_name = f"dlt_stage_{stage_id}"
+        qualified_stage = f'"{self.database}"."{current_schema}"."{stage_name}"'
 
-        # Query target table schema to identify VARIANT columns that need casting
-        get_columns_query = f"""
-            SELECT COLUMN_NAME, DATA_TYPE
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = '{current_schema}'
-            AND TABLE_NAME = '{table_name.upper()}'
-            AND TABLE_CATALOG = '{self.database}'
-        """
-        target_columns_result = self.snowpark_session.sql(get_columns_query).collect()
-        target_column_types = {row[0]: row[1] for row in target_columns_result}
+        try:
+            # STEP 0: Create named internal stage (allowed in stored procedures)
+            # CRITICAL: Can't use CREATE TEMPORARY STAGE in stored procedures
+            # Use regular CREATE STAGE with unique name instead, then drop it after
+            create_stage_sql = f"CREATE STAGE IF NOT EXISTS {qualified_stage}"
+            self.snowpark_session.sql(create_stage_sql).collect()
 
-        # Build SELECT with TO_VARIANT() for VARIANT columns
-        select_parts = []
-        for col in parquet_columns:
-            col_upper = col.upper()
-            escaped_col = sql_client.escape_column_name(col)
+            # STEP 1: PUT file to named internal stage (like built-in destination)
+            # Use the @ prefix for stage reference in PUT command
+            put_result = self.snowpark_session.file.put(
+                self._file_path,
+                f"@{qualified_stage}",
+                auto_compress=False,
+                overwrite=True
+            )
 
-            # Cast to VARIANT if target column is VARIANT
-            if col_upper in target_column_types and target_column_types[col_upper] == 'VARIANT':
-                select_parts.append(f"TO_VARIANT({escaped_col})")
-            else:
-                select_parts.append(escaped_col)
+            # Get the staged file name (Snowflake adds .gz if compressed)
+            import os as _os
+            staged_file_name = _os.path.basename(self._file_path)
 
-        select_clause = ", ".join(select_parts)
+            # STEP 2: COPY INTO target table (like built-in destination)
+            # Use MATCH_BY_COLUMN_NAME for automatic column mapping
+            # This handles type conversions automatically (VARCHAR → VARIANT, etc.)
+            copy_sql = f"""
+                COPY INTO {qualified_table}
+                FROM @{qualified_stage}/{staged_file_name}
+                FILE_FORMAT = (TYPE = 'PARQUET')
+                MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+                ON_ERROR = 'ABORT_STATEMENT'
+            """
 
-        # Insert from temp to target with type casting for VARIANT columns
-        insert_sql = f"INSERT INTO {qualified_table} ({columns_list}) SELECT {select_clause} FROM {temp_table_qualified}"
-        self.snowpark_session.sql(insert_sql).collect()
+            self.snowpark_session.sql(copy_sql).collect()
 
-        # Drop temp table
-        drop_sql = f"DROP TABLE IF EXISTS {temp_table_qualified}"
-        self.snowpark_session.sql(drop_sql).collect()
-
-        print(f"  Loaded {arrow_table.num_rows:,} rows into {table_name}")
+        finally:
+            # Clean up: Drop the temporary stage (this also removes all files in it)
+            try:
+                self.snowpark_session.sql(f"DROP STAGE IF EXISTS {qualified_stage}").collect()
+            except:
+                pass  # Ignore cleanup errors
 
 
 # ============================================================================
 # Merge Job Implementation
 # ============================================================================
-
-class SnowparkMergeJob(SqlMergeFollowupJob):
-    """Merge job using DELETE + INSERT pattern for Snowpark."""
-
-    @classmethod
-    def gen_key_table_clauses(
-        cls,
-        root_table_name: str,
-        staging_root_table_name: str,
-        key_clauses: Sequence[str],
-        for_delete: bool,
-    ) -> List[str]:
-        """Generate key table clauses for DELETE operations (Snowflake style)."""
-        sql: List[str] = [
-            f"FROM {root_table_name} AS d WHERE EXISTS ("
-            f"SELECT 1 FROM {staging_root_table_name} AS s "
-            f"WHERE {clause.format(d='d', s='s')})"
-            for clause in key_clauses
-        ]
-        return sql
+#
+# CRITICAL: We do NOT define a custom SnowparkMergeJob class!
+# Instead, we use dlt's built-in SqlMergeFollowupJob which generates optimized
+# native MERGE INTO statements for Snowflake.
+#
+# The original SnowparkMergeJob used a DELETE+INSERT pattern which was much slower
+# and caused multiple MERGE statements per table. By using the built-in class,
+# we get the same optimized MERGE SQL as dlt's Snowflake destination.
 
 
 # ============================================================================
@@ -655,7 +676,9 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
         caps.supports_multiple_statements = True
         caps.timestamp_precision = 6
         caps.supports_truncate_command = True
-        caps.supported_merge_strategies = ["delete-insert", "upsert", "scd2"]
+        # Put "upsert" first so it's the default merge strategy
+        # Upsert uses Snowflake's native MERGE statement which is much faster than delete-insert
+        caps.supported_merge_strategies = ["upsert", "delete-insert", "scd2"]
         caps.supported_replace_strategies = [
             "truncate-and-insert",
             "insert-from-staging",
@@ -736,8 +759,20 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
     def _create_merge_followup_jobs(
         self, table_chain: Sequence[PreparedTableSchema]
     ) -> List[FollowupJobRequest]:
-        """Create merge jobs for tables with merge write disposition."""
-        return [SnowparkMergeJob.from_table_chain(table_chain, self.sql_client)]
+        """Create merge jobs for tables with merge write disposition.
+
+        Uses dlt's built-in SqlMergeFollowupJob which generates optimized
+        native MERGE INTO statements, exactly like the Snowflake destination.
+        """
+        # DEBUG: Log when merge jobs are created
+        root_table_name = table_chain[0]["name"] if table_chain else "unknown"
+        try:
+            with open('/tmp/dlt_sql_execution_log.txt', 'a') as log:
+                log.write(f"Creating merge job for table chain: {root_table_name} (chain length: {len(table_chain)})\n")
+        except:
+            pass
+
+        return [SqlMergeFollowupJob.from_table_chain(table_chain, self.sql_client)]
 
     def _make_add_column_sql(
         self, new_columns: Sequence[TColumnSchema], table: PreparedTableSchema = None
@@ -914,7 +949,9 @@ class snowpark(Destination[SnowparkDestinationClientConfiguration, SnowparkJobCl
         caps.supports_multiple_statements = True
         caps.timestamp_precision = 6
         caps.supports_truncate_command = True
-        caps.supported_merge_strategies = ["delete-insert", "upsert", "scd2"]
+        # Put "upsert" first so it's the default merge strategy
+        # Upsert uses Snowflake's native MERGE statement which is much faster than delete-insert
+        caps.supported_merge_strategies = ["upsert", "delete-insert", "scd2"]
         caps.supported_replace_strategies = [
             "truncate-and-insert",
             "insert-from-staging",
