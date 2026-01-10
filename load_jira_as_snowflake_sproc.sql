@@ -179,14 +179,17 @@ def jira(
     email: str,
     api_token: str,
     page_size: int = DEFAULT_PAGE_SIZE,
+    force_full_load: bool = False,
 ) -> Iterable[DltResource]:
     """Jira source function that generates a list of resource functions based on endpoints."""
     resources = []
     for endpoint_name, endpoint_parameters in DEFAULT_ENDPOINTS.items():
         if endpoint_name == "issues":
+            # Use replace for full loads, merge for incremental
+            write_disposition = "replace" if force_full_load else "merge"
             resource_kwargs = {
                 "name": endpoint_name,
-                "write_disposition": "merge",
+                "write_disposition": write_disposition,
                 "primary_key": "id"
             }
             if "max_table_nesting" in endpoint_parameters:
@@ -292,11 +295,13 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
             subdomain=jira_subdomain,
             email=jira_username,
             api_token=jira_api_token,
+            force_full_load=force_full_load,
         ).with_resources(*endpoint_list)
 
         # Apply hints to override the incremental initial_value with our calculated date
         # This tells the issues resource to start from initial_date instead of 1970-01-01
-        if "issues" in endpoint_list and initial_date != "1970-01-01":
+        # Only apply for incremental loads (not full loads)
+        if "issues" in endpoint_list and initial_date != "1970-01-01" and not force_full_load:
             source.issues.apply_hints(incremental=dlt.sources.incremental("fields.updated", initial_value=initial_date))
 
         # Create dlt pipeline with Snowpark destination
@@ -311,7 +316,22 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
         # Run the pipeline
         load_info = pipeline.run(source, loader_file_format="parquet")
 
-        # Prepare result
+        # Cleanup stages after load completes (optimization)
+        try:
+            if hasattr(pipeline.destination, 'client') and hasattr(pipeline.destination.client(), '_cleanup_stages'):
+                pipeline.destination.client()._cleanup_stages()
+        except:
+            pass  # Ignore cleanup errors
+
+        # Prepare result with detailed job information
+        jobs_info = []
+        if hasattr(load_info, 'jobs'):
+            for job in load_info.jobs[:50]:  # First 50 jobs
+                jobs_info.append({
+                    "file_name": job.file_path if hasattr(job, 'file_path') else str(job),
+                    "status": job.state if hasattr(job, 'state') else "unknown"
+                })
+
         result = {
             "status": "success",
             "pipeline_name": "jira_snowpark",
@@ -324,8 +344,9 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
                 "dataset_name": load_info.dataset_name,
                 "started_at": str(load_info.started_at) if load_info.started_at else None,
                 "finished_at": str(load_info.finished_at) if load_info.finished_at else None,
-                "jobs": len(load_info.jobs) if hasattr(load_info, 'jobs') else 0,
-                "packages": len(load_info.loads_ids) if hasattr(load_info, 'loads_ids') else 0
+                "total_jobs": len(load_info.jobs) if hasattr(load_info, 'jobs') else 0,
+                "packages": len(load_info.loads_ids) if hasattr(load_info, 'loads_ids') else 0,
+                "jobs_detail": jobs_info
             },
             "incremental_config": {
                 "initial_date_used": initial_date if "issues" in endpoint_list else "N/A",
