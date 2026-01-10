@@ -185,11 +185,11 @@ def jira(
     resources = []
     for endpoint_name, endpoint_parameters in DEFAULT_ENDPOINTS.items():
         if endpoint_name == "issues":
-            # Use replace for full loads, merge for incremental
-            write_disposition = "replace" if force_full_load else "merge"
+            # Always use merge (replace causes schema inference issues with NULLs)
+            # For full loads, we use full_refresh=True on the pipeline instead
             resource_kwargs = {
                 "name": endpoint_name,
-                "write_disposition": write_disposition,
+                "write_disposition": "merge",
                 "primary_key": "id"
             }
             if "max_table_nesting" in endpoint_parameters:
@@ -305,12 +305,13 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
             source.issues.apply_hints(incremental=dlt.sources.incremental("fields.updated", initial_value=initial_date))
 
         # Create dlt pipeline with Snowpark destination
+        # full_refresh=True drops all tables and resets state (used for force_full_load)
         pipeline = dlt.pipeline(
             pipeline_name="jira_snowpark",
             destination=snowpark(snowpark_session=snowpark_session, database=target_database),
             dataset_name="jira",
             pipelines_dir="/tmp/dlt_pipelines",
-            full_refresh=False
+            full_refresh=force_full_load
         )
 
         # Run the pipeline
