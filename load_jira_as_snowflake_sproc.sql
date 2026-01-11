@@ -47,6 +47,11 @@ DEFAULT_ENDPOINTS = {
             "expand": "changelog",
         },
         "columns": {
+            # Clustering for query performance on project-based queries
+            "fields__project__id": {
+                "cluster": True,
+                "description": "Project ID - used for clustering to improve query performance"
+            },
             # Prevent unnesting of these custom fields - keep as JSON
             "fields__customfield_10003": {"data_type": "json"},
             "fields__customfield_10020": {"data_type": "json"},
@@ -143,7 +148,9 @@ def get_issues_incremental(
     api_token: str,
     page_size: int,
     updated_at: dlt.sources.incremental[str] = dlt.sources.incremental(
-        "fields.updated", initial_value="1970-01-01"
+        "fields.updated",
+        initial_value="1970-01-01",
+        end_value="2022-01-31"  # Limit to 2022 for faster testing
     ),
 ) -> Iterable[TDataItem]:
     """Fetch JIRA issues incrementally based on the updated timestamp."""
@@ -153,13 +160,24 @@ def get_issues_incremental(
 
     base_jql = base_params.get("jql", "project is not EMPTY")
 
+    # Build date range filter
     last_value = updated_at.last_value
     if "T" in last_value:
-        jql_date = last_value.split("T")[0]
+        jql_start_date = last_value.split("T")[0]
     else:
-        jql_date = last_value
+        jql_start_date = last_value
 
-    incremental_jql = f"{base_jql} AND updated >= '{jql_date}' ORDER BY updated ASC"
+    # Add end_value filter if present (for testing with limited data range)
+    end_value = updated_at.end_value
+    if end_value:
+        if "T" in end_value:
+            jql_end_date = end_value.split("T")[0]
+        else:
+            jql_end_date = end_value
+        incremental_jql = f"{base_jql} AND updated >= '{jql_start_date}' AND updated <= '{jql_end_date}' ORDER BY updated ASC"
+    else:
+        incremental_jql = f"{base_jql} AND updated >= '{jql_start_date}' ORDER BY updated ASC"
+
     base_params["jql"] = incremental_jql
 
     yield from get_paginated_data(
@@ -304,18 +322,44 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
         if "issues" in endpoint_list and initial_date != "1970-01-01" and not force_full_load:
             source.issues.apply_hints(incremental=dlt.sources.incremental("fields.updated", initial_value=initial_date))
 
+        # Diagnostic: Check which tables exist before pipeline runs
+        tables_before = {}
+        try:
+            for schema_name in ['JIRA', 'JIRA_STAGING']:
+                query = f"""
+                    SELECT table_name
+                    FROM INFORMATION_SCHEMA.TABLES
+                    WHERE table_schema = '{schema_name}'
+                      AND table_catalog = '{target_database}'
+                      AND (table_name = 'ISSUES' OR table_name LIKE 'ISSUES\\_\\_FIELDS\\_\\_COMMENT%')
+                    ORDER BY table_name
+                """
+                result = snowpark_session.sql(query).collect()
+                tables_before[schema_name] = [row[0] for row in result]
+        except:
+            tables_before = {"error": "Could not query tables"}
+
         # Create dlt pipeline with Snowpark destination
-        # full_refresh=True drops all tables and resets state (used for force_full_load)
+        # Note: Do NOT use full_refresh=True on pipeline constructor - it creates timestamped schemas
         pipeline = dlt.pipeline(
             pipeline_name="jira_snowpark",
             destination=snowpark(snowpark_session=snowpark_session, database=target_database),
             dataset_name="jira",
-            pipelines_dir="/tmp/dlt_pipelines",
-            full_refresh=force_full_load
+            pipelines_dir="/tmp/dlt_pipelines"
         )
 
+        # Configure loader to reduce retry count from 5 to 2 for faster failure detection
+        import os
+        os.environ['LOAD__MAX_RETRY_COUNT'] = '2'
+
         # Run the pipeline
-        load_info = pipeline.run(source, loader_file_format="parquet")
+        # Use loader_file_format="parquet" for efficient bulk loading
+        # Use refresh="drop_sources" for full load (drops and recreates tables in same schema)
+        load_info = pipeline.run(
+            source,
+            loader_file_format="parquet",
+            refresh="drop_sources" if force_full_load else None
+        )
 
         # Cleanup stages after load completes (optimization)
         try:
@@ -332,6 +376,23 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
                     "file_name": job.file_path if hasattr(job, 'file_path') else str(job),
                     "status": job.state if hasattr(job, 'state') else "unknown"
                 })
+
+        # Diagnostic: Check which tables exist after pipeline runs
+        tables_after = {}
+        try:
+            for schema_name in ['JIRA', 'JIRA_STAGING']:
+                query = f"""
+                    SELECT table_name
+                    FROM INFORMATION_SCHEMA.TABLES
+                    WHERE table_schema = '{schema_name}'
+                      AND table_catalog = '{target_database}'
+                      AND (table_name = 'ISSUES' OR table_name LIKE 'ISSUES\\_\\_FIELDS\\_\\_COMMENT%')
+                    ORDER BY table_name
+                """
+                result = snowpark_session.sql(query).collect()
+                tables_after[schema_name] = [row[0] for row in result]
+        except:
+            tables_after = {"error": "Could not query tables"}
 
         result = {
             "status": "success",
@@ -352,6 +413,10 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
             "incremental_config": {
                 "initial_date_used": initial_date if "issues" in endpoint_list else "N/A",
                 "note": "Loading issues updated since this date" if initial_date != "1970-01-01" else "Full historical load from 1970-01-01"
+            },
+            "diagnostics": {
+                "tables_before_pipeline": tables_before,
+                "tables_after_pipeline": tables_after
             }
         }
 
@@ -370,12 +435,12 @@ def load_jira_data(snowpark_session, target_database: str = 'RAW', endpoints: Op
 $$;
 
 -- Example calls:
--- Load specific endpoints:
---   CALL raw.jira.p_load_jira('RAW', '["issues"]');
---   CALL raw.jira.p_load_jira('RAW', '["projects"]');
+-- Load specific endpoints (incremental):
+CALL raw.jira.p_load_jira('RAW', '["issues"]', FALSE);
+CALL raw.jira.p_load_jira('RAW', '["projects"]', FALSE);
 --
--- Load all endpoints:
---   CALL raw.jira.p_load_jira('RAW');
+-- Load all endpoints (incremental):
+CALL raw.jira.p_load_jira('RAW', NULL, FALSE);
 --
--- Force full historical load (ignores existing data):
---   CALL raw.jira.p_load_jira('RAW', '["issues"]', TRUE);
+-- Force full historical load (replaces all data):
+CALL raw.jira.p_load_jira('RAW', '["issues"]', TRUE);

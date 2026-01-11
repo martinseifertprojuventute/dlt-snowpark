@@ -31,7 +31,7 @@ import base64
 import zlib
 import os
 import re
-from typing import Optional, Sequence, Iterator, List, Dict, Any, Tuple, Type, ClassVar, Final
+from typing import Optional, Sequence, Iterator, List, Any, Tuple, Type, Final
 from contextlib import contextmanager
 
 from snowflake.snowpark import Session, Row
@@ -53,13 +53,12 @@ from dlt.common.destination.client import (
     RunnableLoadJob,
     HasFollowupJobs,
 )
-from dlt.common.schema import Schema, TTableSchema, TColumnSchema, TColumnHint
+from dlt.common.schema import Schema, TTableSchema, TColumnSchema, TColumnHint, TSchemaTables
 from dlt.common.schema.typing import TColumnType
 from dlt.common.schema.utils import get_columns_names_with_prop
 from dlt.common.storages import FileStorage
 from dlt.common.storages.load_package import LoadJobInfo
 from dlt.common.utils import uniq_id
-from dlt.common import logger
 from dlt.destinations.sql_client import SqlClientBase, raise_database_error
 from dlt.destinations.job_client_impl import SqlJobClientBase, SqlJobClientWithStagingDataset
 from dlt.destinations.sql_jobs import SqlMergeFollowupJob
@@ -264,12 +263,20 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
                 else:
                     result = []
         except Exception as ex:
-            # Check if this is an "already exists" error that should be ignored
-            if "already exists" in str(ex).lower() or "object with same name already exists" in str(ex).lower():
-                # Return empty result for ignored errors
+            error_msg = str(ex).lower()
+            query_lower = query.lower()
+
+            # Check if this is an error that should be ignored
+            if ("already exists" in error_msg or
+                "object with same name already exists" in error_msg):
+                # Ignore "already exists" errors for idempotency
+                result = []
+            elif ("does not exist" in error_msg and "truncate" in query_lower and "create" not in query_lower):
+                # Ignore TRUNCATE errors on non-existent tables (happens after manual DROP)
+                # BUT: Never ignore CREATE TABLE errors - they must succeed!
                 result = []
             else:
-                # Re-raise other errors
+                # Re-raise all other errors, including CREATE TABLE failures
                 raise
 
         # Return cursor with results (matching Snowflake connector behavior)
@@ -278,10 +285,18 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
 
     @contextmanager
     def begin_transaction(self) -> Iterator[DBTransaction]:
-        """Begin a transaction (Snowpark doesn't have explicit transactions like connector)."""
+        """
+        Begin a transaction context.
+
+        IMPORTANT: Snowflake stored procedures have different transaction semantics:
+        - Multi-statement execution (num_statements=0) uses SYSTEM$MULTISTMT with implicit transactions
+        - Explicit BEGIN/COMMIT conflicts with SYSTEM$MULTISTMT
+        - Auto-commit mode is actually fine because multi-statement batches are atomic
+
+        Solution: Don't use explicit transactions - rely on Snowflake's multi-statement atomicity
+        """
         try:
-            # Snowpark doesn't have explicit transaction control like the connector
-            # But we can mark that we're in a transaction for logical grouping
+            # Just track state - no explicit BEGIN
             self._in_transaction = True
             yield self
             self.commit_transaction()
@@ -290,14 +305,13 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
             raise
 
     def commit_transaction(self) -> None:
-        """Commit transaction."""
-        # Snowpark auto-commits, but we track state
+        """Commit transaction (no-op in stored procedure context)."""
+        # Snowflake multi-statement execution handles commits automatically
         self._in_transaction = False
 
     def rollback_transaction(self) -> None:
-        """Rollback transaction."""
-        # Snowpark doesn't have explicit rollback in the same way
-        # If we need true transactional behavior, we'd need to use savepoints
+        """Rollback transaction (no-op in stored procedure context)."""
+        # Snowflake multi-statement execution handles rollbacks automatically
         self._in_transaction = False
 
     def has_dataset(self) -> bool:
@@ -501,22 +515,19 @@ class SnowparkLoadJob(RunnableLoadJob):
             # Split by newline (dlt writes one statement per line)
             statements = [stmt.strip() for stmt in sql_content.split('\n') if stmt.strip()]
 
-            try:
-                for stmt in statements:
-                    try:
-                        self.snowpark_session.sql(stmt).collect()
-                    except Exception as stmt_error:
-                        # Check if it's a "table already exists" error
-                        error_msg = str(stmt_error).lower()
-                        if 'already exists' in error_msg or 'object with same name already exists' in error_msg:
-                            # This is expected for staging tables - ignore and continue
-                            continue
-                        else:
-                            # Re-raise other errors
-                            raise
-            except Exception:
-                # Log the error but don't fail the entire job
-                pass
+            for stmt in statements:
+                try:
+                    self.snowpark_session.sql(stmt).collect()
+                except Exception as stmt_error:
+                    # Check if it's a "table already exists" error
+                    error_msg = str(stmt_error).lower()
+                    if 'already exists' in error_msg or 'object with same name already exists' in error_msg:
+                        # This is expected for staging tables - ignore and continue
+                        continue
+                    else:
+                        # CRITICAL: Re-raise other errors - don't silently swallow them!
+                        # This includes MERGE failures for child tables
+                        raise
             return
 
         # Parquet file - load using COPY INTO (matching dlt's built-in Snowflake destination)
@@ -574,6 +585,7 @@ class SnowparkLoadJob(RunnableLoadJob):
                 ON_ERROR = 'ABORT_STATEMENT'
             """
 
+            # Execute COPY INTO - table should exist from schema update phase
             self.snowpark_session.sql(copy_sql).collect()
 
         finally:
@@ -637,7 +649,10 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
         self.config: SnowparkDestinationClientConfiguration = config
         self.sql_client: SnowparkSqlClient = sql_client
         self.type_mapper = self.capabilities.get_type_mapper()
-        self.active_hints = {}  # No index support for Snowpark yet
+        # Support for Snowflake-specific features (matching built-in destination)
+        self.active_hints = {
+            "primary_key": "PRIMARY KEY",  # Metadata-only in Snowflake, not enforced
+        }
 
         # Track staging for cleanup (optimization: reuse stages per load package)
         self._load_stage: Optional[str] = None
@@ -800,11 +815,115 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
             "ADD COLUMN\n" + ",\n".join(self._get_column_def_sql(c, table) for c in new_columns)
         ]
 
+    def _get_column_def_sql(self, column: TColumnSchema, table: PreparedTableSchema = None) -> str:
+        """Override to add column comments (matching built-in Snowflake destination behavior)."""
+        # Get base column definition from parent
+        column_def_sql = super()._get_column_def_sql(column, table)
+
+        # Add COMMENT clause if description is present
+        # This matches Databricks pattern and is supported by Snowflake
+        if column.get("description"):
+            comment = column.get("description")
+            # Escape single quotes in comment
+            escaped_comment = comment.replace("'", "''")
+            column_def_sql = f"{column_def_sql} COMMENT '{escaped_comment}'"
+
+        return column_def_sql
+
+    def _get_constraints_sql(
+        self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
+    ) -> str:
+        """
+        Generate PRIMARY KEY constraint SQL (matching built-in Snowflake destination).
+
+        Note: Snowflake PKs are metadata-only (not enforced), but they:
+        - Document table relationships
+        - Can help query optimizer
+        - Only added during CREATE TABLE (not ALTER TABLE)
+        """
+        # Check if primary key creation is enabled
+        if self.config.create_indexes:
+            from dlt.common.schema.utils import get_columns_names_with_prop
+            from dlt.common.utils import uniq_id
+
+            # Build partial table schema with new columns
+            partial: TTableSchema = {
+                "name": table_name,
+                "columns": {c["name"]: c for c in new_columns},
+            }
+
+            # Get columns marked with primary_key hint
+            pk_columns = get_columns_names_with_prop(partial, "primary_key")
+
+            if pk_columns:
+                if generate_alter:
+                    # PKs cannot be added in ALTER TABLE - warn and skip
+                    import logging
+                    logging.warning(
+                        f"PRIMARY KEY on {table_name} constraint cannot be added in ALTER TABLE and is ignored"
+                    )
+                else:
+                    # Generate PK constraint for CREATE TABLE
+                    pk_constraint_name = self.sql_client.escape_column_name(f"PK_{table_name}_{uniq_id(4)}")
+                    quoted_pk_cols = ", ".join(
+                        self.sql_client.escape_column_name(col) for col in pk_columns
+                    )
+                    return f",\nCONSTRAINT {pk_constraint_name} PRIMARY KEY ({quoted_pk_cols})"
+
+        return ""
+
+    def _get_cluster_sql(self, cluster_column_names: Sequence[str]) -> str:
+        """Generate CLUSTER BY clause or DROP CLUSTERING KEY (matching built-in)."""
+        if cluster_column_names:
+            cluster_column_names_str = ",".join(
+                [self.sql_client.escape_column_name(col) for col in cluster_column_names]
+            )
+            return f"CLUSTER BY ({cluster_column_names_str})"
+        else:
+            return "DROP CLUSTERING KEY"
+
+    def _get_alter_cluster_sql(self, table_name: str, cluster_column_names: Sequence[str]) -> str:
+        """Generate ALTER TABLE for clustering (matching built-in)."""
+        qualified_table = self.sql_client.make_qualified_table_name(table_name)
+        cluster_clause = self._get_cluster_sql(cluster_column_names)
+        return f"ALTER TABLE {qualified_table} {cluster_clause}"
+
+    def _add_cluster_sql(
+        self,
+        sql: List[str],
+        table_name: str,
+        generate_alter: bool,
+    ) -> List[str]:
+        """
+        Add CLUSTER BY / DROP CLUSTERING KEY clause to SQL statements (matching built-in).
+
+        Clustering improves query performance on large tables by physically organizing data.
+        Use the 'cluster' hint on columns to enable clustering.
+        """
+        # Get columns marked with cluster hint
+        cluster_column_names = [
+            c["name"]
+            for c in self.schema.get_table_columns(table_name).values()
+            if c.get("cluster")
+        ]
+
+        if generate_alter:
+            # For ALTER TABLE: issue separate ALTER statement
+            stmt = self._get_alter_cluster_sql(table_name, cluster_column_names)
+            sql.append(stmt)
+        elif not generate_alter and cluster_column_names:
+            # For CREATE TABLE: append CLUSTER BY to CREATE statement
+            sql[0] = sql[0] + " " + self._get_cluster_sql(cluster_column_names)
+
+        return sql
+
     def _get_table_update_sql(
         self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
     ) -> List[str]:
-        """Get table update SQL (same as Snowflake)."""
+        """Get table update SQL with clustering support (matching built-in Snowflake destination)."""
         sql = super()._get_table_update_sql(table_name, new_columns, generate_alter)
+        # Add clustering clause (for both CREATE and ALTER)
+        sql = self._add_cluster_sql(sql, table_name, generate_alter)
         return sql
 
     def _from_db_type(
@@ -812,6 +931,99 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
     ) -> TColumnType:
         """Map database types using type mapper."""
         return self.type_mapper.from_destination_type(bq_t, precision, scale)
+
+    def update_stored_schema(
+        self,
+        only_tables: Optional[List[str]] = None,
+        expected_update: Optional[TSchemaTables] = None,
+    ) -> Optional[TSchemaTables]:
+        """
+        Override to always verify and create missing tables, even when schema hash exists.
+
+        CRITICAL FIX for nested tables with merge disposition:
+        - The base implementation only creates tables that have data in the current load
+        - For merge disposition, child tables without data are skipped
+        - This causes "Table does not exist" errors when loading to staging schema
+
+        This override:
+        1. Extends only_tables to include ALL child tables (not just those with data)
+        2. Verifies all tables exist and creates missing ones
+        3. Works even when schema hash already exists in _dlt_version
+        """
+        from dlt.common.schema.utils import get_nested_tables
+
+        # Validate schema tamper check (from base class)
+        version_hash = self.schema.version_hash
+        if self.schema.is_modified:
+            from dlt.common.destination.exceptions import DestinationSchemaTampered
+            raise DestinationSchemaTampered(
+                self.schema.name, version_hash, self.schema.stored_version_hash
+            )
+
+        applied_update: TSchemaTables = {}
+
+        # Check if schema exists in storage
+        schema_info = self.get_stored_schema_by_hash(self.schema.stored_version_hash)
+
+        # Expand only_tables to include ALL child tables AND parent tables
+        # This is critical for merge disposition where child tables need to exist
+        # in both main and staging schemas
+        # CRITICAL: Also include root/parent tables even if they weren't in only_tables
+        # because they might have been filtered out by has_table_seen_data
+        all_required_tables = set()
+        if only_tables:
+            from dlt.common.schema.utils import get_root_table
+
+            for table_name in only_tables:
+                # Add this table
+                all_required_tables.add(table_name)
+
+                # CRITICAL: Add the root table for this table
+                # This ensures parent tables are created even if they haven't "seen data"
+                if table_name in self.schema.tables:
+                    root_table = get_root_table(self.schema.tables, table_name)
+                    all_required_tables.add(root_table["name"])
+
+                    # Add all its nested child tables
+                    for child_table in get_nested_tables(self.schema.tables, root_table["name"]):
+                        all_required_tables.add(child_table["name"])
+
+        if schema_info is None:
+            # Schema hash doesn't exist - do full schema update
+            with self.maybe_ddl_transaction():
+                # CRITICAL: Pass all_required_tables (expanded list) not only_tables
+                # This ensures ALL child tables are created, not just those with data
+                tables_to_create = list(all_required_tables) if all_required_tables else only_tables
+                applied_update = self._execute_schema_update_sql(tables_to_create)
+        else:
+            # CRITICAL FIX: Schema hash exists, but we still need to verify tables exist!
+            # The base implementation would return here without creating any tables.
+            # We override this behavior to always verify and create missing tables.
+
+            if all_required_tables:
+                # Verify these specific tables exist and create missing ones
+                with self.maybe_ddl_transaction():
+                    # Get actual tables from storage
+                    storage_tables = list(self.get_storage_tables(all_required_tables))
+
+                    # Find tables that don't exist (have empty column dict)
+                    missing_tables = [table_name for table_name, columns in storage_tables if len(columns) == 0]
+
+                    if missing_tables:
+                        # Some tables are missing - create them
+                        applied_update = self._execute_schema_update_sql(missing_tables)
+            else:
+                # No only_tables specified - verify ALL schema tables exist
+                # This shouldn't happen in normal operation, but handle it just in case
+                all_table_names = list(self.schema.tables.keys())
+                with self.maybe_ddl_transaction():
+                    storage_tables = list(self.get_storage_tables(all_table_names))
+                    missing_tables = [table_name for table_name, columns in storage_tables if len(columns) == 0]
+
+                    if missing_tables:
+                        applied_update = self._execute_schema_update_sql(missing_tables)
+
+        return applied_update
 
     # ========================================================================
     # WithStateSync Implementation
@@ -904,11 +1116,13 @@ class SnowparkDestinationClientConfiguration(DestinationClientDwhConfiguration):
 
     snowpark_session: Any = None  # Type hint must be Any for non-standard types with @configspec
     database: str = "RAW"
+    create_indexes: bool = True  # Create PRIMARY KEY constraints (metadata-only in Snowflake)
 
     def __init__(
         self,
         snowpark_session: Any = None,  # Accept Any to avoid configspec validation issues
         database: str = "RAW",
+        create_indexes: bool = True,
         destination_name: str = "snowpark",
         environment: Optional[str] = None,
         **kwargs
@@ -916,6 +1130,7 @@ class SnowparkDestinationClientConfiguration(DestinationClientDwhConfiguration):
         super().__init__(destination_name=destination_name, environment=environment, **kwargs)
         self.snowpark_session = snowpark_session
         self.database = database
+        self.create_indexes = create_indexes
 
 
 # ============================================================================
