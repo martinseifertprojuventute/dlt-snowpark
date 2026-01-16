@@ -1,446 +1,38 @@
 """
-Complete Snowpark SQL Destination with Full WithStateSync Support
+Simplified Snowpark Destination for dlt v1.20.0
 
-This is a production-ready implementation that:
-- Inherits from SqlJobClientBase for full dlt integration
-- Implements WithStateSync for automatic state persistence
-- Uses Snowpark instead of Snowflake Python connector
-- Supports all dlt features: merge, replace, append, incremental loading
-- Works inside Snowflake stored procedures
+A minimal implementation that:
+- Uses Snowpark session (works inside Snowflake stored procedures)
+- Implements WithStateSync for incremental loading state persistence
+- Uses Snowpark's native Table.merge() for merge operations
+- Supports parquet file loading via PUT + COPY INTO
 
 Architecture:
-- SnowparkSqlClient: Wraps Snowpark session as SqlClientBase
-- SnowparkLoadJob: Handles file loads with PUT + COPY INTO (like built-in destination)
-- Uses dlt's built-in SqlMergeFollowupJob for optimized native MERGE statements
-- SnowparkJobClient: Main client with WithStateSync implementation
-- SnowparkDestination: Destination class for dlt.pipeline()
-
-Performance Optimizations:
-- Stage Reuse: One named stage per load package (vs one per file)
-  * Reduces DDL overhead: ~200 CREATE/DROP → ~2 per load
-  * Files organized in subdirectories per table to avoid conflicts
-  * Estimated 5-10% performance improvement on large loads
-- Batch Cleanup: Stages cleaned up after load completes (not per file)
-- Optimized Imports: os, re imported once at module level
+- snowpark: Destination class for dlt.pipeline()
+- SnowparkJobClient: Minimal job client with state sync and merge
+- Uses dlt's built-in schema management and type mapping
 """
 
-import pyarrow as pa
 import json
-import dataclasses
-import base64
-import zlib
 import os
-import re
-from typing import Optional, Sequence, Iterator, List, Any, Tuple, Type, Final
-from contextlib import contextmanager
+from typing import Optional, Any, Type
+import dataclasses
 
-from snowflake.snowpark import Session, Row
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import when_matched, when_not_matched
 
-# dlt imports
 from dlt.common.destination import Destination, DestinationCapabilitiesContext
 from dlt.common.configuration import configspec
-from dlt.destinations.type_mapping import TypeMapperImpl
-from dlt.common.arithmetics import DEFAULT_NUMERIC_PRECISION, DEFAULT_NUMERIC_SCALE
 from dlt.common.destination.client import (
-    PreparedTableSchema,
     StateInfo,
     StorageSchemaInfo,
     WithStateSync,
-    DestinationClientConfiguration,
     DestinationClientDwhConfiguration,
-    FollowupJobRequest,
     LoadJob,
     RunnableLoadJob,
-    HasFollowupJobs,
 )
-from dlt.common.schema import Schema, TTableSchema, TColumnSchema, TColumnHint, TSchemaTables
-from dlt.common.schema.typing import TColumnType
-from dlt.common.schema.utils import get_columns_names_with_prop
-from dlt.common.storages import FileStorage
-from dlt.common.storages.load_package import LoadJobInfo
+from dlt.common.schema import Schema, TTableSchema
 from dlt.common.utils import uniq_id
-from dlt.destinations.sql_client import SqlClientBase, raise_database_error
-from dlt.destinations.job_client_impl import SqlJobClientBase, SqlJobClientWithStagingDataset
-from dlt.destinations.sql_jobs import SqlMergeFollowupJob
-from dlt.destinations.typing import TNativeConn, DBTransaction
-from dlt.common.destination.dataset import DBApiCursor
-from dlt.destinations.exceptions import (
-    DatabaseTerminalException,
-    DatabaseTransientException,
-    DatabaseUndefinedRelation,
-)
-
-
-# ============================================================================
-# Type Mapper (same as Snowflake)
-# ============================================================================
-
-class SnowparkTypeMapper(TypeMapperImpl):
-    """Type mapper for Snowpark (identical to Snowflake's type mapper)."""
-    BIGINT_PRECISION = 19
-
-    sct_to_unbound_dbt = {
-        "json": "VARIANT",
-        "text": "VARCHAR",
-        "double": "FLOAT",
-        "bool": "BOOLEAN",
-        "date": "DATE",
-        "timestamp": "TIMESTAMP_TZ",
-        "bigint": f"NUMBER({BIGINT_PRECISION},0)",
-        "binary": "BINARY",
-        "time": "TIME",
-    }
-
-    sct_to_dbt = {
-        "text": "VARCHAR(%i)",
-        "timestamp": "TIMESTAMP_TZ(%i)",
-        "decimal": "NUMBER(%i,%i)",
-        "time": "TIME(%i)",
-        "wei": "NUMBER(%i,%i)",
-    }
-
-    dbt_to_sct = {
-        "VARCHAR": "text",
-        "FLOAT": "double",
-        "BOOLEAN": "bool",
-        "DATE": "date",
-        "TIMESTAMP_TZ": "timestamp",
-        "BINARY": "binary",
-        "VARIANT": "json",
-        "TIME": "time",
-    }
-
-    def from_destination_type(
-        self, db_type: str, precision: Optional[int] = None, scale: Optional[int] = None
-    ) -> TColumnType:
-        """Convert Snowflake database type to dlt type."""
-        if db_type == "NUMBER":
-            if precision == self.BIGINT_PRECISION and scale == 0:
-                return dict(data_type="bigint")
-            elif (precision, scale) == self.capabilities.wei_precision:
-                return dict(data_type="wei")
-            return dict(data_type="decimal", precision=precision, scale=scale)
-        if db_type == "TIMESTAMP_NTZ":
-            return dict(data_type="timestamp", precision=precision, scale=scale, timezone=False)
-        return super().from_destination_type(db_type, precision, scale)
-
-
-# ============================================================================
-# SQL Client Implementation
-# ============================================================================
-
-class SnowparkCursor:
-    """Cursor-like wrapper around Snowpark query results."""
-
-    def __init__(self, rows: List[Row]):
-        self.rows = rows or []
-        self.idx = 0
-        self.description = None
-
-    def fetchone(self) -> Optional[Tuple]:
-        if self.idx < len(self.rows):
-            row = self.rows[self.idx]
-            self.idx += 1
-            # Convert Row to tuple
-            if hasattr(row, 'asDict'):
-                return tuple(row.asDict().values())
-            return tuple(row)
-        return None
-
-    def fetchall(self) -> List[Tuple]:
-        result = []
-        for row in self.rows[self.idx:]:
-            if hasattr(row, 'asDict'):
-                result.append(tuple(row.asDict().values()))
-            else:
-                result.append(tuple(row))
-        self.idx = len(self.rows)
-        return result
-
-    def fetchmany(self, size: int = 1) -> List[Tuple]:
-        result = []
-        for _ in range(size):
-            row = self.fetchone()
-            if row is None:
-                break
-            result.append(row)
-        return result
-
-    def close(self):
-        pass
-
-
-class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
-    """SQL client that wraps Snowpark session."""
-
-    def __init__(
-        self,
-        dataset_name: str,
-        staging_dataset_name: str,
-        snowpark_session: Session,
-        database: str,
-        capabilities: DestinationCapabilitiesContext,
-    ):
-        self.snowpark_session = snowpark_session
-        self.database = database.upper()
-        self._in_transaction = False
-        super().__init__(database, dataset_name, staging_dataset_name, capabilities)
-
-    def open_connection(self) -> Session:
-        """Snowpark session is already open."""
-        return self.snowpark_session
-
-    def close_connection(self) -> None:
-        """Don't close Snowpark session (managed externally)."""
-        pass
-
-    @property
-    def native_connection(self) -> Session:
-        return self.snowpark_session
-
-    def fully_qualified_dataset_name(self, escape: bool = True, staging: bool = False) -> str:
-        """Override to ensure schema name is always uppercase (Snowflake standard)."""
-        # Apply casefold to ensure uppercase
-        # Use staging schema if requested, otherwise use main schema
-        dataset = self.staging_dataset_name if staging else self.dataset_name
-        schema_name = self.capabilities.casefold_identifier(dataset)
-        if escape:
-            return f'"{self.database}"."{schema_name}"'
-        else:
-            return f"{self.database}.{schema_name}"
-
-    def execute_sql(self, sql: str, *args: Any, **kwargs: Any) -> Optional[Sequence[Sequence[Any]]]:
-        """Execute SQL and return results."""
-        with self.execute_query(sql, *args, **kwargs) as cursor:
-            if cursor.description is None:
-                return []  # Return empty list instead of None when no results
-            return cursor.fetchall()
-
-    @contextmanager
-    @raise_database_error
-    def execute_query(self, query: str, *args: Any, **kwargs: Any) -> Iterator[DBApiCursor]:
-        """Execute query and return cursor (Snowpark-compatible version)."""
-        # CRITICAL: Snowpark's StoredProcConnection doesn't support parameter binding
-        # We must manually substitute parameters into the SQL string
-        db_args = args if args else kwargs if kwargs else None
-
-        # Manually substitute %s parameters if present
-        if db_args and '%s' in query:
-            # Convert tuple/list of args to properly escaped SQL values
-            if isinstance(db_args, (tuple, list)):
-                escaped_args = []
-                for arg in db_args:
-                    if arg is None:
-                        escaped_args.append('NULL')
-                    elif isinstance(arg, str):
-                        # Escape single quotes in strings
-                        escaped_args.append(f"'{arg.replace(chr(39), chr(39) + chr(39))}'")
-                    elif isinstance(arg, (int, float)):
-                        escaped_args.append(str(arg))
-                    else:
-                        # For other types, convert to string and quote
-                        escaped_args.append(f"'{str(arg).replace(chr(39), chr(39) + chr(39))}'")
-
-                # Replace %s placeholders with escaped values
-                query = query.replace('%s', '{}').format(*escaped_args)
-
-        # Execute query using underlying Snowflake connector cursor
-        # Snowpark's session.sql() doesn't handle all SQL types well (especially with semicolons)
-        # Use the connector cursor directly (like the built-in Snowflake destination does)
-        try:
-            # Get the underlying Snowflake connection from Snowpark session
-            conn = self.snowpark_session._conn._conn
-
-            # Execute using connector cursor with num_statements=0
-            # This tells Snowflake to execute ALL statements in the query (matching built-in destination)
-            # From dlt's SnowflakeSqlClient.execute_query() line 130: cur.execute(query, db_args, num_statements=0)
-            with conn.cursor() as cur:
-                cur.execute(query, num_statements=0)
-
-                # Fetch results if available
-                if cur.description:
-                    result = cur.fetchall()
-                else:
-                    result = []
-        except Exception as ex:
-            error_msg = str(ex).lower()
-            query_lower = query.lower()
-
-            # Check if this is an error that should be ignored
-            if ("already exists" in error_msg or
-                "object with same name already exists" in error_msg):
-                # Ignore "already exists" errors for idempotency
-                result = []
-            elif ("does not exist" in error_msg and "truncate" in query_lower and "create" not in query_lower):
-                # Ignore TRUNCATE errors on non-existent tables (happens after manual DROP)
-                # BUT: Never ignore CREATE TABLE errors - they must succeed!
-                result = []
-            else:
-                # Re-raise all other errors, including CREATE TABLE failures
-                raise
-
-        # Return cursor with results (matching Snowflake connector behavior)
-        cursor = SnowparkCursor(result if result is not None else [])
-        yield cursor
-
-    @contextmanager
-    def begin_transaction(self) -> Iterator[DBTransaction]:
-        """
-        Begin a transaction context.
-
-        IMPORTANT: Snowflake stored procedures have different transaction semantics:
-        - Multi-statement execution (num_statements=0) uses SYSTEM$MULTISTMT with implicit transactions
-        - Explicit BEGIN/COMMIT conflicts with SYSTEM$MULTISTMT
-        - Auto-commit mode is actually fine because multi-statement batches are atomic
-
-        Solution: Don't use explicit transactions - rely on Snowflake's multi-statement atomicity
-        """
-        try:
-            # Just track state - no explicit BEGIN
-            self._in_transaction = True
-            yield self
-            self.commit_transaction()
-        except Exception:
-            self.rollback_transaction()
-            raise
-
-    def commit_transaction(self) -> None:
-        """Commit transaction (no-op in stored procedure context)."""
-        # Snowflake multi-statement execution handles commits automatically
-        self._in_transaction = False
-
-    def rollback_transaction(self) -> None:
-        """Rollback transaction (no-op in stored procedure context)."""
-        # Snowflake multi-statement execution handles rollbacks automatically
-        self._in_transaction = False
-
-    def has_dataset(self) -> bool:
-        """Check if schema exists."""
-        try:
-            # Apply casefold to ensure uppercase (Snowflake standard)
-            schema_name = self.capabilities.casefold_identifier(self.dataset_name)
-            query = f"""
-                SELECT COUNT(*)
-                FROM INFORMATION_SCHEMA.SCHEMATA
-                WHERE SCHEMA_NAME = '{schema_name}'
-                AND CATALOG_NAME = '{self.database}'
-            """
-            result = self.snowpark_session.sql(query).collect()
-            return result[0][0] > 0 if result else False
-        except Exception:
-            return False
-
-    def create_dataset(self) -> None:
-        """Create schema if it doesn't exist - use base class implementation."""
-        # Base class uses fully_qualified_dataset_name() which we override to use uppercase
-        # This ensures schema is created with proper casing
-        self.execute_sql("CREATE SCHEMA IF NOT EXISTS %s" % self.fully_qualified_dataset_name())
-
-    def drop_dataset(self) -> None:
-        """Drop schema - use base class implementation."""
-        # Base class uses fully_qualified_dataset_name() which we override to use uppercase
-        self.execute_sql("DROP SCHEMA IF EXISTS %s CASCADE" % self.fully_qualified_dataset_name())
-
-    # CRITICAL: Use base class methods for qualified names
-    # They properly use capabilities.casefold_identifier which respects Snowflake's casing rules
-    # No need to override these - the base implementation handles it correctly via capabilities
-
-    @classmethod
-    def _make_database_exception(cls, ex: Exception) -> Exception:
-        """
-        Convert Snowpark/Snowflake exceptions to dlt database exceptions.
-
-        This method is required by SqlClientBase and classifies exceptions as:
-        - DatabaseTerminalException: Permanent errors (schema issues, constraint violations)
-        - DatabaseTransientException: Temporary errors (network, locks, timeouts)
-        - DatabaseUndefinedRelation: Missing tables/schemas
-        """
-        # CRITICAL: Check for Snowpark exceptions first (SnowparkSQLException)
-        # These have the same structure as Snowflake connector exceptions but different class
-        try:
-            from snowflake.snowpark.exceptions import SnowparkSQLException
-            if isinstance(ex, SnowparkSQLException):
-                # SnowparkSQLException has sqlstate and errno just like connector exceptions
-                if hasattr(ex, 'sqlstate'):
-                    if ex.sqlstate == "42710":  # Object already exists
-                        return DatabaseTransientException(ex)
-                    elif ex.sqlstate in {"42S02", "02000"}:  # Object not found
-                        return DatabaseUndefinedRelation(ex)
-                    elif ex.sqlstate == "22023":  # Non-nullable column
-                        return DatabaseTerminalException(ex)
-                # Fallback to message checking
-                msg = str(ex).lower()
-                if "already exists" in msg:
-                    return DatabaseTransientException(ex)
-                elif "does not exist" in msg:
-                    return DatabaseUndefinedRelation(ex)
-                else:
-                    return DatabaseTransientException(ex)
-        except ImportError:
-            pass
-
-        # Import here to avoid circular dependency and allow running without snowflake.connector
-        try:
-            from snowflake.connector import errors as snowflake_errors
-
-            if isinstance(ex, snowflake_errors.ProgrammingError):
-                if ex.sqlstate == "P0000" and ex.errno == 100132:
-                    # Multi-statement execution error
-                    msg = str(ex)
-                    if "NULL result in a non-nullable column" in msg:
-                        return DatabaseTerminalException(ex)
-                    elif "does not exist or not authorized" in msg:
-                        return DatabaseUndefinedRelation(ex)
-                    else:
-                        return DatabaseTransientException(ex)
-                if ex.sqlstate in {"42S02", "02000"}:
-                    return DatabaseUndefinedRelation(ex)
-                elif ex.sqlstate == "42710":  # Object already exists - ignore (like CREATE TABLE IF NOT EXISTS)
-                    # This is a transient error that dlt can safely ignore
-                    return DatabaseTransientException(ex)
-                elif ex.sqlstate == "22023":  # Non-nullable column
-                    return DatabaseTerminalException(ex)
-                elif ex.sqlstate == "42000" and ex.errno == 904:  # Invalid identifier
-                    return DatabaseTerminalException(ex)
-                elif ex.sqlstate == "22000":
-                    return DatabaseTerminalException(ex)
-                else:
-                    return DatabaseTransientException(ex)
-
-            elif isinstance(ex, snowflake_errors.IntegrityError):
-                return DatabaseTerminalException(ex)
-            elif isinstance(ex, snowflake_errors.DatabaseError):
-                return DatabaseTransientException(ex)
-            elif isinstance(ex, TypeError):
-                # Snowflake raises TypeError on malformed query parameters
-                return DatabaseTransientException(ex)
-            elif cls.is_dbapi_exception(ex):
-                return DatabaseTransientException(ex)
-            else:
-                return ex
-        except ImportError:
-            # If snowflake.connector is not available, check for Snowpark exceptions
-            # Snowpark exceptions are usually RuntimeError or generic exceptions
-            msg = str(ex).lower()
-            if "does not exist" in msg or "not found" in msg:
-                return DatabaseUndefinedRelation(ex)
-            elif "already exists" in msg:
-                # Object already exists - treat as transient (ignorable)
-                return DatabaseTransientException(ex)
-            elif "constraint" in msg or "integrity" in msg or "duplicate" in msg:
-                return DatabaseTerminalException(ex)
-            else:
-                # Default to transient for Snowpark exceptions
-                return DatabaseTransientException(ex)
-
-    @staticmethod
-    def is_dbapi_exception(ex: Exception) -> bool:
-        """Check if exception is a DB-API exception."""
-        try:
-            from snowflake.connector import DatabaseError
-            return isinstance(ex, DatabaseError)
-        except ImportError:
-            return False
 
 
 # ============================================================================
@@ -448,15 +40,7 @@ class SnowparkSqlClient(SqlClientBase[Session], DBTransaction):
 # ============================================================================
 
 class SnowparkLoadJob(RunnableLoadJob):
-    """Load job that writes Parquet files using Snowpark DataFrames.
-
-    CRITICAL: This class should NOT inherit from HasFollowupJobs!
-    Only the SnowparkJobClient (which inherits HasFollowupJobs) should create
-    followup merge jobs. If this class also has HasFollowupJobs, then:
-    1. Parquet loads complete → Client creates SQL merge job
-    2. SQL merge job completes → This triggers ANOTHER merge job (infinite loop!)
-    3. That SQL job completes → Another merge job... forever
-    """
+    """Load job that stages and loads parquet files using Snowpark."""
 
     def __init__(
         self,
@@ -464,162 +48,99 @@ class SnowparkLoadJob(RunnableLoadJob):
         snowpark_session: Session,
         database: str,
         schema: str,
-        table_schema: PreparedTableSchema = None,
-        load_stage: Optional[str] = None,
+        table_name: str,
+        table_schema: Optional[TTableSchema] = None,
     ):
         super().__init__(file_path)
         self.snowpark_session = snowpark_session
         self.database = database.upper()
         self.schema_name = schema.upper()
-        self.table_schema = table_schema
-        self.load_stage = load_stage  # Shared stage for this load package (optimization)
+        self.table_name = table_name.upper()
+        self.table_schema = table_schema  # dlt schema with column type hints
         self._job_client: "SnowparkJobClient" = None
 
+    def _get_variant_columns(self) -> set:
+        """Get column names that should be VARIANT based on dlt schema."""
+        variant_cols = set()
+        if not self.table_schema:
+            return variant_cols
+
+        columns = self.table_schema.get("columns", {})
+        for col_name, col_info in columns.items():
+            # Check for json data_type hint
+            if col_info.get("data_type") == "json":
+                variant_cols.add(col_name.upper())
+            # Also check for complex type (nested structures)
+            if col_info.get("data_type") == "complex":
+                variant_cols.add(col_name.upper())
+        return variant_cols
+
     def run(self) -> None:
-        """Load the file using Snowpark - handles both Parquet and SQL files."""
-        sql_client = self._job_client.sql_client
-        table_name = self.load_table_name
-
-        # Check file extension to determine how to handle it
-        if self._file_path.endswith('.sql'):
-            # SQL file - contains merge/delete operations including CREATE TEMPORARY TABLE
-            # CRITICAL: Snowflake stored procedures don't support CREATE TEMPORARY TABLE
-            # We need to replace it with CREATE TABLE (regular table with unique name)
-            #
-            # dlt's SQL job files contain one statement per line (separated by \n)
-            # From sql_jobs.py line 63-64: "Remove line breaks from multiline statements and write
-            # one statement per line in output file to support clients that need to execute
-            # one statement at a time (i.e. snowflake)"
-            with open(self._file_path, 'r', encoding='utf-8') as f:
-                sql_content = f.read()
-
-            # CRITICAL: Snowflake stored procedures do NOT support CREATE TEMPORARY TABLE
-            # (tested with both session.sql() and connector cursor - both fail)
-            # Solution: Replace CREATE TEMPORARY TABLE with CREATE TABLE
-            # The tables have unique names from dlt's uniq_id() so they won't conflict
-            # and they're dropped after the merge operation completes
-            sql_content = sql_content.replace('CREATE TEMPORARY TABLE', 'CREATE TABLE')
-
-            # CRITICAL: Add IF NOT EXISTS to all CREATE TABLE statements
-            # dlt generates CREATE TABLE without IF NOT EXISTS, which causes errors
-            # when tables already exist from previous runs
-            # This matches how dlt's built-in Snowflake destination handles existing tables
-            sql_content = re.sub(
-                r'\bCREATE TABLE\s+"',
-                'CREATE TABLE IF NOT EXISTS "',
-                sql_content,
-                flags=re.IGNORECASE
-            )
-
-            # Execute statements ONE AT A TIME like dlt's built-in destination
-            # Split by newline (dlt writes one statement per line)
-            statements = [stmt.strip() for stmt in sql_content.split('\n') if stmt.strip()]
-
-            for stmt in statements:
-                try:
-                    self.snowpark_session.sql(stmt).collect()
-                except Exception as stmt_error:
-                    # Check if it's a "table already exists" error
-                    error_msg = str(stmt_error).lower()
-                    if 'already exists' in error_msg or 'object with same name already exists' in error_msg:
-                        # This is expected for staging tables - ignore and continue
-                        continue
-                    else:
-                        # CRITICAL: Re-raise other errors - don't silently swallow them!
-                        # This includes MERGE failures for child tables
-                        raise
-            return
-
-        # Parquet file - load using COPY INTO (matching dlt's built-in Snowflake destination)
-        # The built-in destination uses PUT + COPY INTO which is MUCH faster than DataFrame inserts
-        # Built-in destination approach:
-        # 1. PUT files to internal stage
-        # 2. COPY INTO target table with MATCH_BY_COLUMN_NAME
-        # 3. Execute merge SQL files afterwards
-        #
-        # We'll replicate this using Snowpark's PUT + COPY INTO functionality
-
-        # Check if file is empty
+        """Load parquet file using PUT + COPY INTO target table."""
         if os.path.getsize(self._file_path) == 0:
             return  # Skip empty files
 
-        # Get fully qualified table name - this uses the CORRECT schema (main or staging)
-        qualified_table = sql_client.make_qualified_table_name(table_name)
-        current_schema = sql_client.capabilities.casefold_identifier(sql_client.dataset_name)
+        session = self.snowpark_session
+        target_table = f"{self.database}.{self.schema_name}.{self.table_name}"
+        ff_parquet = f"{self.database}.{self.schema_name}.FF_PARQUET"
 
-        # OPTIMIZATION: Use shared stage if available, otherwise create unique stage
-        if self.load_stage:
-            # Reuse shared stage (one per load package)
-            qualified_stage = self.load_stage
-            cleanup_stage = False  # Don't drop shared stage here
-        else:
-            # Fallback: Create unique stage for this file
-            stage_id = uniq_id(8)
-            stage_name = f"dlt_stage_{stage_id}"
-            qualified_stage = f'"{self.database}"."{current_schema}"."{stage_name}"'
-            self.snowpark_session.sql(f"CREATE STAGE IF NOT EXISTS {qualified_stage}").collect()
-            cleanup_stage = True  # Drop after use
+        # Create temporary stage referencing the named file format
+        stage_id = uniq_id(8)
+        stage_name = f"DLT_STAGE_{stage_id}"
+        session.sql(f"CREATE TEMPORARY STAGE {stage_name} FILE_FORMAT = {ff_parquet}").collect()
 
-        try:
-            # STEP 1: PUT file to named internal stage (like built-in destination)
-            # Use the @ prefix for stage reference in PUT command
-            # Create subdirectory per table to avoid file conflicts
-            table_prefix = f"{table_name}/"
-            self.snowpark_session.file.put(
-                self._file_path,
-                f"@{qualified_stage}/{table_prefix}",
-                auto_compress=False,
-                overwrite=True
+        # PUT file to stage
+        session.file.put(
+            self._file_path,
+            f"@{stage_name}/",
+            auto_compress=False,
+            overwrite=True,
+        )
+
+        # Get columns that should be VARIANT (json type in dlt schema)
+        variant_columns = self._get_variant_columns()
+        # Build SQL list for CASE expression, or empty string if no variant columns
+        variant_cols_sql = ",".join(f"'{c}'" for c in variant_columns) if variant_columns else "''"
+
+        # Create table from parquet schema if it doesn't exist
+        # Transform column names to uppercase to avoid case-sensitive identifiers
+        # Force all columns to be NULLABLE to handle schema variations across batches
+        # Override type to VARIANT for columns marked as json in dlt schema
+        file_name = os.path.basename(self._file_path)
+        session.sql(f"""
+            CREATE TABLE IF NOT EXISTS {target_table}
+            USING TEMPLATE (
+                SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
+                    'COLUMN_NAME', UPPER(COLUMN_NAME),
+                    'TYPE', CASE
+                        WHEN UPPER(COLUMN_NAME) IN ({variant_cols_sql}) THEN 'VARIANT'
+                        ELSE TYPE
+                    END,
+                    'NULLABLE', TRUE
+                ))
+                FROM TABLE(INFER_SCHEMA(
+                    LOCATION => '@{stage_name}/{file_name}',
+                    FILE_FORMAT => '{ff_parquet}'
+                ))
             )
+        """).collect()
 
-            # Get the staged file name
-            staged_file_name = os.path.basename(self._file_path)
-
-            # STEP 2: COPY INTO target table (like built-in destination)
-            # Use MATCH_BY_COLUMN_NAME for automatic column mapping
-            copy_sql = f"""
-                COPY INTO {qualified_table}
-                FROM @{qualified_stage}/{table_prefix}{staged_file_name}
-                FILE_FORMAT = (TYPE = 'PARQUET')
-                MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-                ON_ERROR = 'ABORT_STATEMENT'
-            """
-
-            # Execute COPY INTO - table should exist from schema update phase
-            self.snowpark_session.sql(copy_sql).collect()
-
-        finally:
-            # Clean up unique stages only (shared stages cleaned up by client)
-            if cleanup_stage:
-                try:
-                    self.snowpark_session.sql(f"DROP STAGE IF EXISTS {qualified_stage}").collect()
-                except:
-                    pass  # Ignore cleanup errors
+        # COPY INTO target table (uses stage's file format)
+        # Snowflake will auto-parse JSON strings into VARIANT columns
+        session.sql(f"""
+            COPY INTO {target_table}
+            FROM @{stage_name}/{file_name}
+            MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+            ON_ERROR = ABORT_STATEMENT
+        """).collect()
 
 
 # ============================================================================
-# Merge Job Implementation
-# ============================================================================
-#
-# CRITICAL: We do NOT define a custom SnowparkMergeJob class!
-# Instead, we use dlt's built-in SqlMergeFollowupJob which generates optimized
-# native MERGE INTO statements for Snowflake.
-#
-# The original SnowparkMergeJob used a DELETE+INSERT pattern which was much slower
-# and caused multiple MERGE statements per table. By using the built-in class,
-# we get the same optimized MERGE SQL as dlt's Snowflake destination.
-
-
-# ============================================================================
-# Job Client with WithStateSync
+# Job Client with State Sync and Snowpark Merge
 # ============================================================================
 
-class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollowupJobs):
-    """
-    Complete Snowpark job client with state sync support.
-
-    This is the main client that dlt uses to interact with Snowflake via Snowpark.
-    """
+class SnowparkJobClient(WithStateSync):
+    """Simplified Snowpark job client with state sync and native merge."""
 
     def __init__(
         self,
@@ -627,481 +148,482 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
         config: "SnowparkDestinationClientConfiguration",
         capabilities: DestinationCapabilitiesContext,
     ):
+        self.schema = schema
+        self.config = config
+        self.capabilities = capabilities
         self.snowpark_session = config.snowpark_session
         self.database = config.database.upper()
+        self.dataset_name = (config.dataset_name or schema.name).upper()
+        self.staging_dataset_name = f"{self.dataset_name}_STAGING"
 
-        # Create dataset names (main and staging)
-        dataset_name, staging_dataset_name = SqlJobClientWithStagingDataset.create_dataset_names(
-            schema, config
-        )
+        # Ensure schemas exist
+        self._ensure_schemas_exist()
+        self._ensure_dlt_tables_exist()
 
-        # Create SQL client wrapper
-        sql_client = SnowparkSqlClient(
-            dataset_name=dataset_name,
-            staging_dataset_name=staging_dataset_name,
-            snowpark_session=self.snowpark_session,
-            database=self.database,
-            capabilities=capabilities,
-        )
+    # Context manager protocol (required by dlt)
+    def __enter__(self) -> "SnowparkJobClient":
+        return self
 
-        super().__init__(schema, config, sql_client)
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass  # No cleanup needed - Snowpark session is managed externally
 
-        self.config: SnowparkDestinationClientConfiguration = config
-        self.sql_client: SnowparkSqlClient = sql_client
-        self.type_mapper = self.capabilities.get_type_mapper()
-        # Support for Snowflake-specific features (matching built-in destination)
-        self.active_hints = {
-            "primary_key": "PRIMARY KEY",  # Metadata-only in Snowflake, not enforced
-        }
+    # Required dlt job client methods
+    def _get_write_disposition(self, table_name: str) -> str:
+        """Get write disposition for a table from the schema.
 
-        # Track staging for cleanup (optimization: reuse stages per load package)
-        self._load_stage: Optional[str] = None
-        self._stages_to_cleanup: List[str] = []
+        For child tables (containing __), inherit from parent table.
+        """
+        # Try both lowercase and original case
+        table_schema = self.schema.tables.get(table_name.lower()) or self.schema.tables.get(table_name)
+        if table_schema:
+            disposition = table_schema.get("write_disposition")
+            if disposition:
+                return disposition
 
-        # Ensure schema exists
-        self._ensure_schema_exists()
+        # For child tables, inherit from parent
+        if "__" in table_name:
+            parent_name = table_name.split("__")[0]
+            parent_schema = self.schema.tables.get(parent_name.lower()) or self.schema.tables.get(parent_name)
+            if parent_schema:
+                return parent_schema.get("write_disposition", "append")
 
-    def _get_destination_capabilities(self) -> DestinationCapabilitiesContext:
-        """Return Snowflake-like capabilities."""
-        caps = DestinationCapabilitiesContext.generic_capabilities()
-        caps.preferred_loader_file_format = "parquet"
-        caps.supported_loader_file_formats = ["parquet", "jsonl"]
-        caps.preferred_staging_file_format = "parquet"
-        caps.supported_staging_file_formats = ["parquet", "jsonl"]
-        caps.escape_identifier = lambda x: f'"{x.upper()}"'
-        caps.escape_literal = lambda x: f"'{str(x).replace(chr(39), chr(39) + chr(39))}'" if isinstance(x, str) else str(x)
-        caps.casefold_identifier = str.upper
-        caps.has_case_sensitive_identifiers = False
-        caps.decimal_precision = (38, 0)
-        caps.wei_precision = (38, 0)
-        caps.max_identifier_length = 255
-        caps.max_column_identifier_length = 255
-        caps.max_query_length = 2 * 1024 * 1024
-        caps.is_max_query_length_in_bytes = True
-        caps.max_text_data_type_length = 16 * 1024 * 1024
-        caps.is_max_text_data_type_length_in_bytes = True
-        caps.supports_ddl_transactions = True
-        caps.supports_transactions = True
-        caps.supports_multiple_statements = True
-        caps.timestamp_precision = 6
-        caps.supports_truncate_command = True
-        # Put "upsert" first so it's the default merge strategy
-        # Upsert uses Snowflake's native MERGE statement which is much faster than delete-insert
-        caps.supported_merge_strategies = ["upsert", "delete-insert", "scd2"]
-        caps.supported_replace_strategies = [
-            "truncate-and-insert",
-            "insert-from-staging",
-            "staging-optimized",
-        ]
-        caps.max_timestamp_precision = 9
-        return caps
+        return "append"
 
-    def _ensure_schema_exists(self) -> None:
-        """Create both main and staging schemas if they don't exist."""
-        try:
-            # Create main schema (e.g., JIRA) - matches dlt's built-in Snowflake destination
-            # IMPORTANT: Apply casefold to ensure proper casing (uppercase for Snowflake)
-            main_schema = self.sql_client.dataset_name
-            main_schema_cased = self.sql_client.capabilities.casefold_identifier(main_schema)
+    def should_truncate_table_before_load(self, table_name: str) -> bool:
+        """Whether to truncate the table before loading.
 
-            # Check if main schema exists
-            check_main_query = f"""
-                SELECT COUNT(*)
-                FROM INFORMATION_SCHEMA.SCHEMATA
-                WHERE SCHEMA_NAME = '{main_schema_cased}'
-                AND CATALOG_NAME = '{self.database}'
-            """
-            result = self.snowpark_session.sql(check_main_query).collect()
-            main_exists = result[0][0] > 0 if result else False
+        - replace: True (truncate and overwrite)
+        - merge: False (use merge logic)
+        - append: False (just append)
+        """
+        disposition = self._get_write_disposition(table_name)
+        return disposition == "replace"
 
-            if not main_exists:
-                # Create main schema with proper casing
-                self.snowpark_session.sql(
-                    f'CREATE SCHEMA IF NOT EXISTS "{self.database}"."{main_schema_cased}"'
-                ).collect()
+    def should_load_data_to_staging_dataset(self, table_name: str) -> bool:
+        """Whether to load data to staging dataset first.
 
-            # Create staging schema (e.g., JIRA_STAGING) - matches dlt's built-in Snowflake destination
-            # The built-in destination creates staging schema on-demand via sql_client
-            staging_schema = self.sql_client.staging_dataset_name
-            if staging_schema:
-                # IMPORTANT: Apply casefold to ensure proper casing (uppercase for Snowflake)
-                staging_schema_cased = self.sql_client.capabilities.casefold_identifier(staging_schema)
+        - replace: False (load directly to main table)
+        - merge: True (load to staging, then merge)
+        - append: False (load directly to main table)
+        """
+        disposition = self._get_write_disposition(table_name)
+        return disposition == "merge"
 
-                # Check if staging schema exists
-                check_query = f"""
-                    SELECT COUNT(*)
-                    FROM INFORMATION_SCHEMA.SCHEMATA
-                    WHERE SCHEMA_NAME = '{staging_schema_cased}'
-                    AND CATALOG_NAME = '{self.database}'
-                """
-                result = self.snowpark_session.sql(check_query).collect()
-                staging_exists = result[0][0] > 0 if result else False
+    def initialize_storage(self, truncate_tables: set = None) -> None:
+        """Initialize storage - create schemas and truncate tables if requested.
 
-                if not staging_exists:
-                    # Create staging schema with proper casing
-                    self.snowpark_session.sql(
-                        f'CREATE SCHEMA IF NOT EXISTS "{self.database}"."{staging_schema_cased}"'
-                    ).collect()
+        Called by dlt before loading data to ensure the destination is ready.
+        """
+        self._ensure_schemas_exist()
+        self._ensure_dlt_tables_exist()
 
-            # NOTE: dlt's built-in Snowflake destination does NOT use USE SCHEMA
-            # It uses fully qualified table names (database.schema.table) in all queries
-            # We follow the same pattern - don't set a default schema
-        except Exception as e:
-            print(f"Warning: Could not create/use schema: {e}")
+        session = self.snowpark_session
 
-    def _get_load_stage(self, load_id: str) -> str:
-        """Get or create a shared stage for this load package (optimization)."""
-        if self._load_stage is None:
-            # Create one stage per load package (reused across all files)
-            stage_name = f"dlt_load_{load_id}"
-            dataset_name = self.sql_client.capabilities.casefold_identifier(self.sql_client.dataset_name)
-            qualified_stage = f'"{self.database}"."{dataset_name}"."{stage_name}"'
-
+        # Drop all staging tables before loading to ensure clean state
+        # Using DROP instead of TRUNCATE so tables get recreated with all nullable columns
+        staging_tables = session.sql(f"""
+            SELECT table_name
+            FROM {self.database}.INFORMATION_SCHEMA.TABLES
+            WHERE table_schema = '{self.staging_dataset_name}'
+            AND table_name NOT LIKE '_DLT%'
+        """).collect()
+        for row in staging_tables:
             try:
-                self.snowpark_session.sql(f"CREATE STAGE IF NOT EXISTS {qualified_stage}").collect()
-                self._load_stage = qualified_stage
-                self._stages_to_cleanup.append(qualified_stage)
+                session.sql(f"DROP TABLE {self.database}.{self.staging_dataset_name}.{row[0]}").collect()
             except Exception:
-                # Fallback to unique stage per file if creation fails
                 pass
 
-        return self._load_stage
+        # Drop main tables if requested (used for replace disposition)
+        # Using DROP instead of TRUNCATE to handle schema changes
+        if truncate_tables:
+            for table_name in truncate_tables:
+                qualified_table = f"{self.database}.{self.dataset_name}.{table_name.upper()}"
+                try:
+                    session.sql(f"DROP TABLE IF EXISTS {qualified_table}").collect()
+                except Exception:
+                    pass  # Table might not exist yet
 
-    def _cleanup_stages(self) -> None:
-        """Cleanup all stages created during this load (called at end of load)."""
-        for stage in self._stages_to_cleanup:
-            try:
-                self.snowpark_session.sql(f"DROP STAGE IF EXISTS {stage}").collect()
-            except Exception:
-                pass  # Ignore cleanup errors
-        self._stages_to_cleanup = []
-        self._load_stage = None
+    def _ensure_schemas_exist(self) -> None:
+        """Create main and staging schemas if they don't exist, plus file format for parquet."""
+        session = self.snowpark_session
+        session.sql(f"CREATE SCHEMA IF NOT EXISTS {self.database}.{self.dataset_name}").collect()
+        session.sql(f"CREATE TRANSIENT SCHEMA IF NOT EXISTS {self.database}.{self.staging_dataset_name}").collect()
+        # Named file format required for INFER_SCHEMA
+        session.sql(f"CREATE FILE FORMAT IF NOT EXISTS {self.database}.{self.dataset_name}.FF_PARQUET TYPE = PARQUET").collect()
+        session.sql(f"CREATE FILE FORMAT IF NOT EXISTS {self.database}.{self.staging_dataset_name}.FF_PARQUET TYPE = PARQUET").collect()
+
+    def _ensure_dlt_tables_exist(self) -> None:
+        """Create dlt metadata tables in main schema."""
+        session = self.snowpark_session
+        schema = f"{self.database}.{self.dataset_name}"
+
+        # _dlt_version: schema version tracking
+        session.sql(f"""
+            CREATE TABLE IF NOT EXISTS {schema}._DLT_VERSION (
+                version INTEGER,
+                engine_version INTEGER,
+                inserted_at TIMESTAMP_TZ,
+                schema_name VARCHAR,
+                version_hash VARCHAR,
+                schema VARIANT
+            )
+        """).collect()
+
+        # _dlt_pipeline_state: incremental loading state
+        session.sql(f"""
+            CREATE TABLE IF NOT EXISTS {schema}._DLT_PIPELINE_STATE (
+                version INTEGER,
+                engine_version INTEGER,
+                pipeline_name VARCHAR,
+                state VARCHAR,
+                created_at TIMESTAMP_TZ,
+                version_hash VARCHAR,
+                _dlt_load_id VARCHAR
+            )
+        """).collect()
+
+        # _dlt_loads: load tracking
+        session.sql(f"""
+            CREATE TABLE IF NOT EXISTS {schema}._DLT_LOADS (
+                load_id VARCHAR,
+                status INTEGER,
+                schema_name VARCHAR,
+                schema_version_hash VARCHAR,
+                inserted_at TIMESTAMP_TZ
+            )
+        """).collect()
+
+    def verify_schema(
+        self,
+        only_tables: set = None,  # noqa: ARG002 - required by dlt interface
+        new_jobs: set = None,  # noqa: ARG002 - required by dlt interface
+    ) -> None:
+        """Ensure all tables have write_disposition set.
+
+        dlt checks write_disposition before calling prepare_load_table,
+        so we need to ensure child tables inherit from their parent.
+        Tables are created automatically by COPY INTO with MATCH_BY_COLUMN_NAME.
+        """
+        # Ensure all child tables have write_disposition inherited from parent
+        for table_name, table_schema in self.schema.tables.items():
+            if "write_disposition" not in table_schema:
+                # Get parent table name (first segment before __)
+                parent_name = table_name.split("__")[0]
+                parent_schema = self.schema.tables.get(parent_name)
+                if parent_schema and "write_disposition" in parent_schema:
+                    table_schema["write_disposition"] = parent_schema["write_disposition"]
+                else:
+                    # Default to append if no parent found
+                    table_schema["write_disposition"] = "append"
+
+    def prepare_load_table(self, table_name: str) -> TTableSchema:
+        """Prepare and return the table schema for loading.
+
+        Called by dlt before creating a load job.
+        Uses dlt's fill_hints_from_parent_and_clone_table to properly inherit write_disposition.
+        """
+        from dlt.common.schema.utils import fill_hints_from_parent_and_clone_table
+
+        # Try to find table in schema
+        table_schema = self.schema.tables.get(table_name) or self.schema.tables.get(table_name.lower())
+        if not table_schema:
+            # Create minimal schema for unknown table
+            table_schema = {"name": table_name}
+
+        # Use dlt's utility to inherit write_disposition from parent
+        return fill_hints_from_parent_and_clone_table(self.schema.tables, table_schema)
+
+    def prepare_load_job_execution(self, job: LoadJob) -> None:
+        """Prepare load job for execution.
+
+        Called by dlt before running the load job. Sets the job client reference.
+        """
+        if hasattr(job, '_job_client'):
+            job._job_client = self
 
     def create_load_job(
         self,
-        table: PreparedTableSchema,
+        table: TTableSchema,
         file_path: str,
         load_id: str,
         restore: bool = False
     ) -> LoadJob:
-        """Create a load job for a file."""
-        # Get shared stage for this load package
-        load_stage = self._get_load_stage(load_id)
+        """Create a load job for a parquet file."""
+        table_name = table.get("name", "unknown")
+
+        # Determine target schema based on write disposition
+        use_staging = self.should_load_data_to_staging_dataset(table_name)
+        target_schema = self.staging_dataset_name if use_staging else self.dataset_name
 
         return SnowparkLoadJob(
             file_path=file_path,
             snowpark_session=self.snowpark_session,
             database=self.database,
-            schema=self.sql_client.dataset_name,
-            table_schema=table,
-            load_stage=load_stage,  # Pass shared stage
+            schema=target_schema,
+            table_name=table_name,
+            table_schema=table,  # Pass dlt schema for VARIANT column detection
         )
 
-    def _create_merge_followup_jobs(
-        self, table_chain: Sequence[PreparedTableSchema]
-    ) -> List[FollowupJobRequest]:
-        """Create merge jobs for tables with merge write disposition.
+    def complete_load(self, load_id: str) -> None:
+        """Mark load as complete and merge staging to main."""
+        session = self.snowpark_session
+        main_schema = f"{self.database}.{self.dataset_name}"
 
-        Uses dlt's built-in SqlMergeFollowupJob which generates optimized
-        native MERGE INTO statements, exactly like the Snowflake destination.
-        """
-        return [SqlMergeFollowupJob.from_table_chain(table_chain, self.sql_client)]
+        # Get list of tables that have data in staging
+        tables_result = session.sql(f"""
+            SELECT table_name
+            FROM {self.database}.INFORMATION_SCHEMA.TABLES
+            WHERE table_schema = '{self.staging_dataset_name}'
+            AND table_name NOT LIKE '_DLT%'
+        """).collect()
 
-    def _make_add_column_sql(
-        self, new_columns: Sequence[TColumnSchema], table: PreparedTableSchema = None
-    ) -> List[str]:
-        """Override because Snowflake requires multiple columns in a single ADD COLUMN clause."""
-        return [
-            "ADD COLUMN\n" + ",\n".join(self._get_column_def_sql(c, table) for c in new_columns)
-        ]
+        for row in tables_result:
+            table_name = row[0]
+            self._merge_table(table_name)
 
-    def _get_column_def_sql(self, column: TColumnSchema, table: PreparedTableSchema = None) -> str:
-        """Override to add column comments (matching built-in Snowflake destination behavior)."""
-        # Get base column definition from parent
-        column_def_sql = super()._get_column_def_sql(column, table)
+        # Record load completion
+        session.sql(f"""
+            INSERT INTO {main_schema}._DLT_LOADS (load_id, status, schema_name, inserted_at)
+            VALUES ('{load_id}', 0, '{self.dataset_name}', CURRENT_TIMESTAMP())
+        """).collect()
 
-        # Add COMMENT clause if description is present
-        # This matches Databricks pattern and is supported by Snowflake
-        if column.get("description"):
-            comment = column.get("description")
-            # Escape single quotes in comment
-            escaped_comment = comment.replace("'", "''")
-            column_def_sql = f"{column_def_sql} COMMENT '{escaped_comment}'"
+    def _merge_table(self, table_name: str) -> None:
+        """Merge a single table from staging to main using Snowpark's native merge."""
+        session = self.snowpark_session
+        main_table_fqn = f"{self.database}.{self.dataset_name}.{table_name}"
+        staging_table_fqn = f"{self.database}.{self.staging_dataset_name}.{table_name}"
 
-        return column_def_sql
+        # Check if staging table has data
+        count_result = session.sql(f"SELECT COUNT(*) FROM {staging_table_fqn}").collect()
+        if not count_result or count_result[0][0] == 0:
+            return
 
-    def _get_constraints_sql(
-        self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
-    ) -> str:
-        """
-        Generate PRIMARY KEY constraint SQL (matching built-in Snowflake destination).
+        # Ensure main table exists
+        try:
+            session.sql(f"CREATE TABLE IF NOT EXISTS {main_table_fqn} LIKE {staging_table_fqn}").collect()
+        except Exception:
+            pass
 
-        Note: Snowflake PKs are metadata-only (not enforced), but they:
-        - Document table relationships
-        - Can help query optimizer
-        - Only added during CREATE TABLE (not ALTER TABLE)
-        """
-        # Check if primary key creation is enabled
-        if self.config.create_indexes:
-            from dlt.common.schema.utils import get_columns_names_with_prop
-            from dlt.common.utils import uniq_id
+        # Handle schema evolution: add any new columns from staging to main
+        # This ensures ALL BY NAME works even when schema has changed
+        staging_cols_result = session.sql(f"""
+            SELECT column_name, data_type
+            FROM {self.database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE table_schema = '{self.staging_dataset_name}' AND table_name = '{table_name}'
+        """).collect()
+        main_cols_result = session.sql(f"""
+            SELECT column_name
+            FROM {self.database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE table_schema = '{self.dataset_name}' AND table_name = '{table_name}'
+        """).collect()
+        main_cols = {row[0] for row in main_cols_result}
 
-            # Build partial table schema with new columns
-            partial: TTableSchema = {
-                "name": table_name,
-                "columns": {c["name"]: c for c in new_columns},
-            }
+        for row in staging_cols_result:
+            col_name, data_type = row[0], row[1]
+            if col_name not in main_cols:
+                session.sql(f"ALTER TABLE {main_table_fqn} ADD COLUMN {col_name} {data_type}").collect()
 
-            # Get columns marked with primary_key hint
-            pk_columns = get_columns_names_with_prop(partial, "primary_key")
+        # Get column names from staging table (for Snowpark merge and primary key detection)
+        staging = session.table(staging_table_fqn)
+        columns = [c.name for c in staging.schema.fields]
 
-            if pk_columns:
-                if generate_alter:
-                    # PKs cannot be added in ALTER TABLE - warn and skip
-                    import logging
-                    logging.warning(
-                        f"PRIMARY KEY on {table_name} constraint cannot be added in ALTER TABLE and is ignored"
-                    )
-                else:
-                    # Generate PK constraint for CREATE TABLE
-                    pk_constraint_name = self.sql_client.escape_column_name(f"PK_{table_name}_{uniq_id(4)}")
-                    quoted_pk_cols = ", ".join(
-                        self.sql_client.escape_column_name(col) for col in pk_columns
-                    )
-                    return f",\nCONSTRAINT {pk_constraint_name} PRIMARY KEY ({quoted_pk_cols})"
+        # Determine primary key:
+        # 1. Check schema for explicit primary_key
+        # 2. Fall back to _DLT_ID if present (dlt-generated for child tables)
+        # 3. Fall back to ID if present
+        primary_key = None
+        table_schema = self.schema.tables.get(table_name.lower()) or self.schema.tables.get(table_name)
+        if table_schema:
+            pk = table_schema.get("primary_key")
+            if pk:
+                primary_key = pk[0].upper() if isinstance(pk, list) else pk.upper()
 
-        return ""
-
-    def _get_cluster_sql(self, cluster_column_names: Sequence[str]) -> str:
-        """Generate CLUSTER BY clause or DROP CLUSTERING KEY (matching built-in)."""
-        if cluster_column_names:
-            cluster_column_names_str = ",".join(
-                [self.sql_client.escape_column_name(col) for col in cluster_column_names]
-            )
-            return f"CLUSTER BY ({cluster_column_names_str})"
-        else:
-            return "DROP CLUSTERING KEY"
-
-    def _get_alter_cluster_sql(self, table_name: str, cluster_column_names: Sequence[str]) -> str:
-        """Generate ALTER TABLE for clustering (matching built-in)."""
-        qualified_table = self.sql_client.make_qualified_table_name(table_name)
-        cluster_clause = self._get_cluster_sql(cluster_column_names)
-        return f"ALTER TABLE {qualified_table} {cluster_clause}"
-
-    def _add_cluster_sql(
-        self,
-        sql: List[str],
-        table_name: str,
-        generate_alter: bool,
-    ) -> List[str]:
-        """
-        Add CLUSTER BY / DROP CLUSTERING KEY clause to SQL statements (matching built-in).
-
-        Clustering improves query performance on large tables by physically organizing data.
-        Use the 'cluster' hint on columns to enable clustering.
-        """
-        # Get columns marked with cluster hint
-        cluster_column_names = [
-            c["name"]
-            for c in self.schema.get_table_columns(table_name).values()
-            if c.get("cluster")
-        ]
-
-        if generate_alter:
-            # For ALTER TABLE: issue separate ALTER statement
-            stmt = self._get_alter_cluster_sql(table_name, cluster_column_names)
-            sql.append(stmt)
-        elif not generate_alter and cluster_column_names:
-            # For CREATE TABLE: append CLUSTER BY to CREATE statement
-            sql[0] = sql[0] + " " + self._get_cluster_sql(cluster_column_names)
-
-        return sql
-
-    def _get_table_update_sql(
-        self, table_name: str, new_columns: Sequence[TColumnSchema], generate_alter: bool
-    ) -> List[str]:
-        """Get table update SQL with clustering support (matching built-in Snowflake destination)."""
-        sql = super()._get_table_update_sql(table_name, new_columns, generate_alter)
-        # Add clustering clause (for both CREATE and ALTER)
-        sql = self._add_cluster_sql(sql, table_name, generate_alter)
-        return sql
-
-    def _from_db_type(
-        self, bq_t: str, precision: Optional[int], scale: Optional[int]
-    ) -> TColumnType:
-        """Map database types using type mapper."""
-        return self.type_mapper.from_destination_type(bq_t, precision, scale)
-
-    def update_stored_schema(
-        self,
-        only_tables: Optional[List[str]] = None,
-        expected_update: Optional[TSchemaTables] = None,
-    ) -> Optional[TSchemaTables]:
-        """
-        Override to always verify and create missing tables, even when schema hash exists.
-
-        CRITICAL FIX for nested tables with merge disposition:
-        - The base implementation only creates tables that have data in the current load
-        - For merge disposition, child tables without data are skipped
-        - This causes "Table does not exist" errors when loading to staging schema
-
-        This override:
-        1. Extends only_tables to include ALL child tables (not just those with data)
-        2. Verifies all tables exist and creates missing ones
-        3. Works even when schema hash already exists in _dlt_version
-        """
-        from dlt.common.schema.utils import get_nested_tables
-
-        # Validate schema tamper check (from base class)
-        version_hash = self.schema.version_hash
-        if self.schema.is_modified:
-            from dlt.common.destination.exceptions import DestinationSchemaTampered
-            raise DestinationSchemaTampered(
-                self.schema.name, version_hash, self.schema.stored_version_hash
-            )
-
-        applied_update: TSchemaTables = {}
-
-        # Check if schema exists in storage
-        schema_info = self.get_stored_schema_by_hash(self.schema.stored_version_hash)
-
-        # Expand only_tables to include ALL child tables AND parent tables
-        # This is critical for merge disposition where child tables need to exist
-        # in both main and staging schemas
-        # CRITICAL: Also include root/parent tables even if they weren't in only_tables
-        # because they might have been filtered out by has_table_seen_data
-        all_required_tables = set()
-        if only_tables:
-            from dlt.common.schema.utils import get_root_table
-
-            for table_name in only_tables:
-                # Add this table
-                all_required_tables.add(table_name)
-
-                # CRITICAL: Add the root table for this table
-                # This ensures parent tables are created even if they haven't "seen data"
-                if table_name in self.schema.tables:
-                    root_table = get_root_table(self.schema.tables, table_name)
-                    all_required_tables.add(root_table["name"])
-
-                    # Add all its nested child tables
-                    for child_table in get_nested_tables(self.schema.tables, root_table["name"]):
-                        all_required_tables.add(child_table["name"])
-
-        if schema_info is None:
-            # Schema hash doesn't exist - do full schema update
-            with self.maybe_ddl_transaction():
-                # CRITICAL: Pass all_required_tables (expanded list) not only_tables
-                # This ensures ALL child tables are created, not just those with data
-                tables_to_create = list(all_required_tables) if all_required_tables else only_tables
-                applied_update = self._execute_schema_update_sql(tables_to_create)
-        else:
-            # CRITICAL FIX: Schema hash exists, but we still need to verify tables exist!
-            # The base implementation would return here without creating any tables.
-            # We override this behavior to always verify and create missing tables.
-
-            if all_required_tables:
-                # Verify these specific tables exist and create missing ones
-                with self.maybe_ddl_transaction():
-                    # Get actual tables from storage
-                    storage_tables = list(self.get_storage_tables(all_required_tables))
-
-                    # Find tables that don't exist (have empty column dict)
-                    missing_tables = [table_name for table_name, columns in storage_tables if len(columns) == 0]
-
-                    if missing_tables:
-                        # Some tables are missing - create them
-                        applied_update = self._execute_schema_update_sql(missing_tables)
+        if not primary_key:
+            # Check actual columns for _DLT_ID or ID
+            if "_DLT_ID" in columns:
+                primary_key = "_DLT_ID"
+            elif "ID" in columns:
+                primary_key = "ID"
             else:
-                # No only_tables specified - verify ALL schema tables exist
-                # This shouldn't happen in normal operation, but handle it just in case
-                all_table_names = list(self.schema.tables.keys())
-                with self.maybe_ddl_transaction():
-                    storage_tables = list(self.get_storage_tables(all_table_names))
-                    missing_tables = [table_name for table_name, columns in storage_tables if len(columns) == 0]
+                # No primary key found - just insert all (no merge possible)
+                session.sql(f"INSERT INTO {main_table_fqn} SELECT * FROM {staging_table_fqn}").collect()
+                return
 
-                    if missing_tables:
-                        applied_update = self._execute_schema_update_sql(missing_tables)
-
-        return applied_update
+        # Use Snowpark's native merge
+        main = session.table(main_table_fqn)
+        try:
+            main.merge(
+                staging,
+                main[primary_key] == staging[primary_key],
+                [
+                    when_matched().update({c: staging[c] for c in columns}),
+                    when_not_matched().insert({c: staging[c] for c in columns})
+                ]
+            )
+        except Exception:
+            # Fallback to SQL MERGE if Snowpark merge fails
+            # ALL BY NAME matches columns by name, ignoring column order
+            # Missing columns in staging will be set to NULL in main
+            session.sql(f"""
+                MERGE INTO {main_table_fqn} m
+                USING {staging_table_fqn} s
+                ON m.{primary_key} = s.{primary_key}
+                WHEN MATCHED THEN UPDATE ALL BY NAME
+                WHEN NOT MATCHED THEN INSERT ALL BY NAME
+            """).collect()
 
     # ========================================================================
     # WithStateSync Implementation
     # ========================================================================
 
     def get_stored_state(self, pipeline_name: str) -> Optional[StateInfo]:
-        """
-        Retrieve pipeline state from _dlt_pipeline_state table.
+        """Retrieve pipeline state from _dlt_pipeline_state table.
 
-        This is called by dlt to restore state before running the pipeline.
+        Returns the compressed state string - dlt will decompress it internally.
         """
         try:
-            state_table = self.sql_client.make_qualified_table_name("_dlt_pipeline_state")
-            loads_table = self.sql_client.make_qualified_table_name("_dlt_loads")
-
-            # Query latest state - use LEFT JOIN to include states even if load isn't recorded yet
-            # This handles the case where state is saved but load completion isn't finalized
-            query = f"""
-                SELECT
-                    s.version,
-                    s.engine_version,
-                    s.state,
-                    s.created_at,
-                    s._dlt_load_id
-                FROM {state_table} AS s
-                LEFT JOIN {loads_table} AS l
-                    ON l.load_id = s._dlt_load_id
-                WHERE s.pipeline_name = %s
-                    AND (l.status = 0 OR l.status IS NULL)
-                ORDER BY s.created_at DESC
+            schema = f"{self.database}.{self.dataset_name}"
+            result = self.snowpark_session.sql(f"""
+                SELECT version, engine_version, state, created_at, _dlt_load_id, version_hash
+                FROM {schema}._DLT_PIPELINE_STATE
+                WHERE pipeline_name = '{pipeline_name}'
+                ORDER BY created_at DESC
                 LIMIT 1
-            """
+            """).collect()
 
-            with self.sql_client.execute_query(query, pipeline_name) as cursor:
-                row = cursor.fetchone()
-
-            if not row:
+            if not result:
                 return None
 
-            # CRITICAL: Return state as-is (compressed string)
-            # dlt's load_pipeline_state_from_destination() will call decompress_state() on it
-            # We should NOT decompress it here - just return the raw state string from the database
-            state_value = row[2]
-
-            # Ensure state is a string (Snowflake VARIANT might return as dict or other type)
-            if isinstance(state_value, str):
-                state_str = state_value
-            elif isinstance(state_value, bytes):
-                state_str = state_value.decode('utf-8')
-            else:
-                # If it's a dict or other type, convert to JSON string
-                # This shouldn't happen with compressed state, but handle it gracefully
-                import json as json_module
-                state_str = json_module.dumps(state_value) if state_value else ""
-
+            row = result[0]
             return StateInfo(
                 version=int(row[0]) if row[0] else 1,
                 engine_version=int(row[1]) if row[1] else 1,
                 pipeline_name=pipeline_name,
-                state=state_str,  # Return compressed state string, not decompressed dict
+                state=str(row[2]) if row[2] else "",
+                created_at=row[3],  # Required field
                 _dlt_load_id=row[4],
-                version_hash=None
+                version_hash=row[5]
             )
-
-        except Exception as e:
-            print(f"  Warning: Could not retrieve stored state: {e}")
+        except Exception:
             return None
 
     def get_stored_schema(self, schema_name: str = None) -> Optional[StorageSchemaInfo]:
-        """Retrieve schema from _dlt_version table."""
-        # For now, return None and let dlt use local schema
-        # Full implementation would query _dlt_version table
-        return None
+        """Retrieve the latest schema version from _DLT_VERSION.
+
+        Note: schema field must be a JSON string, not a dict.
+        dlt's pipeline code does json.loads(schema_info.schema).
+        """
+        try:
+            schema_fqn = f"{self.database}.{self.dataset_name}"
+            result = self.snowpark_session.sql(f"""
+                SELECT version, engine_version, inserted_at, schema_name, version_hash, schema
+                FROM {schema_fqn}._DLT_VERSION
+                ORDER BY inserted_at DESC
+                LIMIT 1
+            """).collect()
+
+            if not result:
+                return None
+
+            row = result[0]
+            # schema must be a JSON string - if Snowflake returns a dict (VARIANT), convert it
+            schema_value = row[5]
+            if isinstance(schema_value, dict):
+                schema_str = json.dumps(schema_value)
+            elif schema_value:
+                schema_str = str(schema_value)
+            else:
+                schema_str = "{}"
+
+            return StorageSchemaInfo(
+                version_hash=row[4],
+                schema_name=row[3] or schema_name or "jira",
+                version=int(row[0]) if row[0] else 1,
+                engine_version=int(row[1]) if row[1] else 1,
+                inserted_at=row[2],
+                schema=schema_str,
+            )
+        except Exception:
+            return None
 
     def get_stored_schema_by_hash(self, version_hash: str) -> Optional[StorageSchemaInfo]:
-        """Retrieve schema by hash."""
-        # For now, return None
-        return None
+        """Retrieve a specific schema version by its hash."""
+        try:
+            schema_fqn = f"{self.database}.{self.dataset_name}"
+            result = self.snowpark_session.sql(f"""
+                SELECT version, engine_version, inserted_at, schema_name, version_hash, schema
+                FROM {schema_fqn}._DLT_VERSION
+                WHERE version_hash = '{version_hash}'
+                LIMIT 1
+            """).collect()
+
+            if not result:
+                return None
+
+            row = result[0]
+            # schema must be a JSON string - if Snowflake returns a dict (VARIANT), convert it
+            schema_value = row[5]
+            if isinstance(schema_value, dict):
+                schema_str = json.dumps(schema_value)
+            elif schema_value:
+                schema_str = str(schema_value)
+            else:
+                schema_str = "{}"
+
+            return StorageSchemaInfo(
+                version_hash=row[4],
+                schema_name=row[3] or "jira",
+                version=int(row[0]) if row[0] else 1,
+                engine_version=int(row[1]) if row[1] else 1,
+                inserted_at=row[2],
+                schema=schema_str,
+            )
+        except Exception:
+            return None
+
+    def update_stored_schema(
+        self,
+        only_tables: set = None,
+        expected_update: set = None,
+    ) -> Optional[StorageSchemaInfo]:
+        """Store the current schema in _dlt_version table.
+
+        Called by dlt after schema verification to persist schema changes.
+        Returns the stored schema info.
+        """
+        session = self.snowpark_session
+        schema_fqn = f"{self.database}.{self.dataset_name}"
+
+        # Serialize the schema to JSON
+        schema_dict = self.schema.to_dict()
+        schema_json = json.dumps(schema_dict).replace("'", "''")
+
+        # Get current version
+        try:
+            result = session.sql(f"""
+                SELECT COALESCE(MAX(version), 0) + 1 FROM {schema_fqn}._DLT_VERSION
+            """).collect()
+            new_version = result[0][0] if result else 1
+        except Exception:
+            new_version = 1
+
+        # Insert new schema version using SELECT instead of VALUES (PARSE_JSON not allowed in VALUES)
+        version_hash = self.schema.version_hash
+        session.sql(f"""
+            INSERT INTO {schema_fqn}._DLT_VERSION
+            (version, engine_version, inserted_at, schema_name, version_hash, schema)
+            SELECT {new_version}, 1, CURRENT_TIMESTAMP(), '{self.schema.name}', '{version_hash}', PARSE_JSON('{schema_json}')
+        """).collect()
+
+        from datetime import datetime, timezone
+        return StorageSchemaInfo(
+            version=new_version,
+            engine_version=1,
+            schema_name=self.schema.name,
+            schema=schema_dict,
+            version_hash=version_hash,
+            inserted_at=datetime.now(timezone.utc)
+        )
 
 
 # ============================================================================
@@ -1112,90 +634,73 @@ class SnowparkJobClient(SqlJobClientWithStagingDataset, WithStateSync, HasFollow
 class SnowparkDestinationClientConfiguration(DestinationClientDwhConfiguration):
     """Configuration for Snowpark destination."""
 
-    destination_type: Final[str] = dataclasses.field(default="snowpark", init=False, repr=False, compare=False)  # type: ignore[misc]
-
-    snowpark_session: Any = None  # Type hint must be Any for non-standard types with @configspec
-    database: str = "RAW"
-    create_indexes: bool = True  # Create PRIMARY KEY constraints (metadata-only in Snowflake)
+    destination_type: str = dataclasses.field(default="snowpark")
+    snowpark_session: Optional[Any] = dataclasses.field(default=None)
+    database: str = dataclasses.field(default="RAW")
+    dataset_name: Optional[str] = dataclasses.field(default=None)
 
     def __init__(
         self,
-        snowpark_session: Any = None,  # Accept Any to avoid configspec validation issues
+        snowpark_session: Any = None,
         database: str = "RAW",
-        create_indexes: bool = True,
+        dataset_name: str = None,
         destination_name: str = "snowpark",
         environment: Optional[str] = None,
         **kwargs
     ):
         super().__init__(destination_name=destination_name, environment=environment, **kwargs)
+        self.destination_type = "snowpark"
         self.snowpark_session = snowpark_session
         self.database = database
-        self.create_indexes = create_indexes
+        self.dataset_name = dataset_name
 
 
 # ============================================================================
-# Destination Class (mimics dlt's Snowflake destination pattern)
+# Destination Class
 # ============================================================================
 
 class snowpark(Destination[SnowparkDestinationClientConfiguration, SnowparkJobClient]):
-    """
-    Snowpark destination that works exactly like dlt's built-in destinations.
-
-    Use this with pipeline.run() just like any other destination:
-
-    Example:
-        >>> from snowpark_destination import snowpark
-        >>>
-        >>> pipeline = dlt.pipeline(
-        ...     pipeline_name="jira",
-        ...     destination=snowpark(snowpark_session=session, database="RAW"),
-        ...     dataset_name="jira"
-        ... )
-        >>>
-        >>> load_info = pipeline.run(source)
-    """
+    """Snowpark destination for dlt pipelines running in Snowflake stored procedures."""
 
     spec = SnowparkDestinationClientConfiguration
 
     def _raw_capabilities(self) -> DestinationCapabilitiesContext:
-        """Return Snowflake-like capabilities (same as SnowparkJobClient._get_destination_capabilities)."""
+        """Return Snowflake-like capabilities."""
         caps = DestinationCapabilitiesContext.generic_capabilities()
+
         caps.preferred_loader_file_format = "parquet"
         caps.supported_loader_file_formats = ["parquet", "jsonl"]
         caps.preferred_staging_file_format = "parquet"
         caps.supported_staging_file_formats = ["parquet", "jsonl"]
-        caps.type_mapper = SnowparkTypeMapper  # CRITICAL: Set the type mapper class
-        caps.escape_identifier = lambda x: f'"{x.upper()}"'
-        caps.escape_literal = lambda x: f"'{str(x).replace(chr(39), chr(39) + chr(39))}'" if isinstance(x, str) else str(x)
+        # No type_mapper - let Snowflake infer types from parquet
+
+        caps.escape_identifier = lambda x: x.upper()  # No quotes - case insensitive
+        caps.escape_literal = lambda x: f"'{str(x).replace(chr(39), chr(39)+chr(39))}'" if isinstance(x, str) else str(x)
         caps.casefold_identifier = str.upper
         caps.has_case_sensitive_identifiers = False
-        caps.decimal_precision = (DEFAULT_NUMERIC_PRECISION, DEFAULT_NUMERIC_SCALE)
-        caps.wei_precision = (DEFAULT_NUMERIC_PRECISION, 0)
+
+        caps.decimal_precision = (38, 9)  # Snowflake defaults
+        caps.wei_precision = (38, 0)
         caps.max_identifier_length = 255
         caps.max_column_identifier_length = 255
         caps.max_query_length = 2 * 1024 * 1024
         caps.is_max_query_length_in_bytes = True
         caps.max_text_data_type_length = 16 * 1024 * 1024
         caps.is_max_text_data_type_length_in_bytes = True
+
         caps.supports_ddl_transactions = True
         caps.supports_transactions = True
         caps.supports_multiple_statements = True
         caps.timestamp_precision = 6
         caps.supports_truncate_command = True
-        # Put "upsert" first so it's the default merge strategy
-        # Upsert uses Snowflake's native MERGE statement which is much faster than delete-insert
         caps.supported_merge_strategies = ["upsert", "delete-insert", "scd2"]
-        caps.supported_replace_strategies = [
-            "truncate-and-insert",
-            "insert-from-staging",
-            "staging-optimized",
-        ]
+        caps.supported_replace_strategies = ["truncate-and-insert", "insert-from-staging"]
         caps.max_timestamp_precision = 9
+
         return caps
 
     @property
     def client_class(self) -> Type[SnowparkJobClient]:
-        """Return the job client class."""
         return SnowparkJobClient
 
     def __init__(
@@ -1207,14 +712,13 @@ class snowpark(Destination[SnowparkDestinationClientConfiguration, SnowparkJobCl
         **kwargs
     ) -> None:
         """
-        Configure the Snowpark destination to use in a pipeline.
+        Configure the Snowpark destination.
 
         Args:
             snowpark_session: Active Snowpark session (from stored procedure)
             database: Target database name
-            destination_name: Name of the destination. Defaults to None.
-            environment: Environment name. Defaults to None.
-            **kwargs: Additional arguments forwarded to the destination config
+            destination_name: Name of the destination
+            environment: Environment name
         """
         super().__init__(
             snowpark_session=snowpark_session,
