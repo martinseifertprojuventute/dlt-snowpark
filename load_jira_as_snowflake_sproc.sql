@@ -9,7 +9,7 @@ HANDLER = 'load_jira_data'
 ARTIFACT_REPOSITORY = snowflake.snowpark.pypi_shared_repository
 PACKAGES = ('snowflake-snowpark-python', 'requests', 'dlt[parquet]', 'pyarrow')
 IMPORTS = ('@META.PYTHON.S_PYTHON/dlt/snowpark_destination.py')
-COMMENT = 'Load Jira data using dlt pipeline with REST API source - simplified v2'
+COMMENT = 'Load Jira data using dlt pipeline with REST API source'
 EXTERNAL_ACCESS_INTEGRATIONS = (i_jira_dlt)
 SECRETS = (
     'jira_creds' = meta.integration.se_jira
@@ -18,7 +18,7 @@ EXECUTE AS CALLER
 AS
 $$
 # ============================================================================
-# Jira Data Load - Simplified dlt Pipeline (v2)
+# Jira Data Load - Simplified dlt Pipeline
 # ============================================================================
 # Uses dlt's REST API source with declarative configuration
 # and Snowpark destination with native merge operations.

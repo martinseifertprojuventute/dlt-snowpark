@@ -8,7 +8,6 @@ dlt (data load tool) is a powerful Python library for building data pipelines. W
 
 1. **Read-only filesystem**: Snowflake procedures operate in a read-only environment, but dlt needs to write configuration, metadata, and state files
 2. **Python connector incompatibility**: dlt's built-in Snowflake destination uses the Python connector, which fails with SQL compilation errors in Snowpark contexts
-3. **Package dependencies**: The curated dlt package has dependency conflicts with `snowflake-snowpark-python`
 
 This custom destination solves these problems by:
 - Using the **Snowpark session** directly (no Python connector needed)
@@ -24,13 +23,13 @@ For more background, see: [Can you run dlt inside Snowflake?](https://www.sfrt.i
 │                     Snowflake Stored Procedure                          │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │                     Your Pipeline Code                            │  │
-│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐   │  │
-│  │  │ dlt Source  │───>│ dlt Pipeline│───>│ Snowpark Destination│   │  │
-│  │  │ (REST API,  │    │             │    │                     │   │  │
-│  │  │  SQL, etc.) │    │  Extract &  │    │  - PUT to stage     │   │  │
-│  │  └─────────────┘    │  Normalize  │    │  - COPY INTO table  │   │  │
-│  │                     └─────────────┘    │  - MERGE for upsert │   │  │
-│  │                                        └─────────────────────┘   │  │
+│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐    │  │
+│  │  │ dlt Source  │───>│ dlt Pipeline│───>│ Snowpark Destination│    │  │
+│  │  │ (REST API,  │    │             │    │                     │    │  │
+│  │  │  SQL, etc.) │    │  Extract &  │    │  - PUT to stage     │    │  │
+│  │  └─────────────┘    │  Normalize  │    │  - COPY INTO table  │    │  │
+│  │                     └─────────────┘    │  - MERGE for upsert │    │  │
+│  │                                        └─────────────────────┘    │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 │                                    │                                    │
 │                                    ▼                                    │
@@ -63,13 +62,12 @@ For more background, see: [Can you run dlt inside Snowflake?](https://www.sfrt.i
 |---------|-------------------|---------------------|
 | **Connection** | Python connector (external) | Snowpark session (internal) |
 | **Runs in Stored Procedures** | No | Yes |
-| **Data Transfer** | Data leaves Snowflake, processed externally, returns | Data never leaves Snowflake |
-| **Network Hops** | 2 (out and back) | 0 (internal only) |
+| **Data Transfer** | Data travels twice: to the temporary storage of dlt and then to SNowflake | Data travels once: to the warehouse in Snowflake |
 | **Authentication** | Requires credentials in config | Uses procedure's execution context |
 | **File Format** | Parquet, JSONL | Parquet (recommended), JSONL |
 | **Schema Inference** | dlt type mapping | Snowflake `INFER_SCHEMA` + dlt hints |
 | **Merge Strategy** | SQL MERGE | Snowpark `Table.merge()` or SQL MERGE |
-| **State Storage** | `_dlt_pipeline_state` table | `_DLT_PIPELINE_STATE` table |
+| **State Storage** | `_dlt_pipeline_state` table locally or in Snowflake | `_DLT_PIPELINE_STATE` table in Snowflake only |
 | **Incremental Loading** | Full support | Full support via `WithStateSync` |
 
 ### Performance Considerations
@@ -78,17 +76,15 @@ The Snowpark destination can be **faster** for certain workloads because:
 - **No network round-trip**: Data extracted from external APIs is loaded directly within Snowflake
 - **No data egress**: Intermediate data stays inside Snowflake's compute layer
 - **Snowpark optimizations**: Uses Snowflake's native merge operations
-
-However, for pipelines that extract from sources **outside** Snowflake (like REST APIs), the network transfer from source to Snowflake still occurs - it just happens inside the stored procedure rather than from an external machine.
+- **hot starting**: A procedure, unlike a container, doesn't have to first start up
 
 ## Files
 
 ```
 dlt/
-├── snowpark_destination.py     # The custom dlt destination (~700 lines)
-├── jira_to_snowflake/
-│   └── load_jira_as_snowflake_sproc.sql  # Example: Jira pipeline (~320 lines)
-└── README.md                   # This file
+├── snowpark_destination.py             # The custom dlt destination (~700 lines)
+├── load_jira_as_snowflake_sproc.sql    # Example: Jira pipeline (~320 lines)jira_to_snowflake/
+└── README.md                           # This file
 ```
 
 ### snowpark_destination.py
@@ -216,16 +212,9 @@ Check that the destination can create tables in the target schema. The procedure
 ### Schema Mismatch Errors
 For incremental loads after schema changes, consider a full reload or manually alter the target tables.
 
-## License
-
-This project is licensed under the MIT License - see [LICENSE](https://github.com/martinseifertprojuventute/dlt-snowpark/blob/main/LICENSE) for details.
-
 ## Author
 
-Created by Martin Seifert
-
-- Website: [sfrt.io](https://www.sfrt.io/)
-- GitHub: [martinseifertprojuventute/dlt-snowpark](https://github.com/martinseifertprojuventute/dlt-snowpark)
+Created by Martin Seifert: [sfrt.io](https://www.sfrt.io/)
 
 ## Acknowledgments
 
