@@ -62,8 +62,8 @@ For more background, see: [Can you run dlt inside Snowflake?](https://www.sfrt.i
 |---------|-------------------|---------------------|
 | **Connection** | Python connector (external) | Snowpark session (internal) |
 | **Runs in Stored Procedures** | No | Yes |
-| **Runs synchronous** | Yes | Yes |
-| **Runs asynchronous** | Yes | Yes |
+| **Runs synchronous** | Yes | Preferred |
+| **Runs asynchronous** | Preferred | Yes |
 | **Data Transfer** | Data travels twice: to the temporary storage of dlt and then to SNowflake | Data travels once: to the warehouse in Snowflake |
 | **Authentication** | Requires credentials in config | Uses procedure's execution context |
 | **File Format** | Parquet, JSONL | Parquet (recommended), JSONL |
