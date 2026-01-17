@@ -71,6 +71,7 @@ For more background, see: [Can you run dlt inside Snowflake?](https://www.sfrt.i
 | **Merge Strategy** | SQL MERGE | Snowpark `Table.merge()` or SQL MERGE |
 | **State Storage** | `_dlt_pipeline_state` table locally or in Snowflake | `_DLT_PIPELINE_STATE` table in Snowflake only |
 | **Incremental Loading** | Full support | Full support via `WithStateSync` |
+| **Credits consumed when running in Snowflake** | 0.06+ (SPCS container) | 1+ (procedure on warehouse |
 
 ### Performance Considerations
 
