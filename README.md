@@ -62,6 +62,8 @@ For more background, see: [Can you run dlt inside Snowflake?](https://www.sfrt.i
 |---------|-------------------|---------------------|
 | **Connection** | Python connector (external) | Snowpark session (internal) |
 | **Runs in Stored Procedures** | No | Yes |
+| **Runs synchronous** | Yes | Yes |
+| **Runs asynchronous** | Yes | Yes |
 | **Data Transfer** | Data travels twice: to the temporary storage of dlt and then to SNowflake | Data travels once: to the warehouse in Snowflake |
 | **Authentication** | Requires credentials in config | Uses procedure's execution context |
 | **File Format** | Parquet, JSONL | Parquet (recommended), JSONL |
@@ -76,7 +78,7 @@ The Snowpark destination can be **faster** for certain workloads because:
 - **No network round-trip**: Data extracted from external APIs is loaded directly within Snowflake
 - **No data egress**: Intermediate data stays inside Snowflake's compute layer
 - **Snowpark optimizations**: Uses Snowflake's native merge operations
-- **hot starting**: A procedure, unlike a container, doesn't have to first start up
+- **Starting hot**: A procedure, unlike a containe r, doesn't have to first start up
 
 ## Files
 
