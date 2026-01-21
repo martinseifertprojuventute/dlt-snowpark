@@ -172,12 +172,16 @@ class SnowparkJobClient(WithStateSync):
         """Get write disposition for a table from the schema.
 
         For child tables (containing __), inherit from parent table.
+        Only 'replace' and 'merge' are supported; 'append' is treated as 'merge'.
         """
         # Try both lowercase and original case
         table_schema = self.schema.tables.get(table_name.lower()) or self.schema.tables.get(table_name)
         if table_schema:
             disposition = table_schema.get("write_disposition")
             if disposition:
+                # Map append to merge - only replace and merge are supported
+                if disposition == "append":
+                    return "merge"
                 return disposition
 
         # For child tables, inherit from parent
@@ -185,9 +189,13 @@ class SnowparkJobClient(WithStateSync):
             parent_name = table_name.split("__")[0]
             parent_schema = self.schema.tables.get(parent_name.lower()) or self.schema.tables.get(parent_name)
             if parent_schema:
-                return parent_schema.get("write_disposition", "append")
+                disposition = parent_schema.get("write_disposition", "merge")
+                # Map append to merge
+                if disposition == "append":
+                    return "merge"
+                return disposition
 
-        return "append"
+        return "merge"
 
     def should_truncate_table_before_load(self, table_name: str) -> bool:
         """Whether to truncate the table before loading.
